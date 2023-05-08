@@ -29,7 +29,7 @@ def get_instances():
         "allocated_storage": 16,
         "cuda_max_good": {},
         "extra_ids": [],
-        "type": "ask"
+        "type": "ask" # bid or ask, ask = on - demand 
     }
     q = json.dumps(search)
     results = requests.get(f"https://cloud.vast.ai/api/v0/bundles/?q={q}").json()
@@ -38,14 +38,16 @@ def get_instances():
         yield {
             "id": i["id"],
             "num_gpus": i["num_gpus"],
-            "price":i["dph_total"]
+            "price":i["dph_total"],
+            "type":i["type"]
         }
 
 def create_instance(id):
     url = wrap_url(f"https://cloud.vast.ai/api/v0/asks/{id}/", {})
     payload = {
         "client_id": "me",
-        "image": "pytorch:latest", #"nvidia/cuda:10.0-cudnn7-runtime",
+        # images can be found here https://cloud.vast.ai/api/v0/users/undefined/templates/null/
+        "image": "pytorch/pytorch",
         "env": {},
         "args_str": "",
         "onstart": "",
@@ -81,15 +83,15 @@ def delete_instance(id):
     r = requests.delete(url, json={})
     print(r)
     print(r.json())
-    
+
 if __name__ == "__main__":
     if True:
         for index, i in enumerate(get_instances()):
-            if 1 <= index:
+            if 3 <= index:
                 print(i)
-                print(create_instance(
-                    i["id"]
-                ))  
+              #  print(create_instance(
+               #     i["id"]
+               # ))
                 break    
     elif True:
         for i in get_instance():
