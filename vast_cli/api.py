@@ -6,12 +6,14 @@ from urllib.parse import quote_plus
 
 load_dotenv()
 
+
 def wrap_url(url, query_args={}):
     query_args["api_key"] = os.environ["API_KEY"]
     return url + "?" + "&".join([
         "{x}={y}".format(x=x, y=quote_plus(y if isinstance(y, str) else json.dumps(y))) for x, y in
-            query_args.items()
+        query_args.items()
     ])
+
 
 def get_instances():
     search = {
@@ -29,18 +31,20 @@ def get_instances():
         "allocated_storage": 16,
         "cuda_max_good": {},
         "extra_ids": [],
-        "type": "ask" # bid or ask, ask = on - demand 
+        "type": "ask"  # bid or ask, ask = on - demand
     }
     q = json.dumps(search)
-    results = requests.get(f"https://cloud.vast.ai/api/v0/bundles/?q={q}").json()
+    results = requests.get(
+        f"https://cloud.vast.ai/api/v0/bundles/?q={q}").json()
     print(results)
     for i in results["offers"]:
         yield {
             "id": i["id"],
             "num_gpus": i["num_gpus"],
-            "price":i["dph_total"],
-            "type":i["type"]
+            "price": i["dph_total"],
+            #            "type":i["type"]
         }
+
 
 def create_instance(id):
     url = wrap_url(f"https://cloud.vast.ai/api/v0/asks/{id}/", {})
@@ -64,19 +68,23 @@ def create_instance(id):
     print(response)
     print(response.json())
 
+
 def get_instance():
     url = wrap_url("https://cloud.vast.ai/api/v0/instances/", {
         "owner": "me"
     })
     for i in requests.get(url).json()["instances"]:
+ #      print(i)
         port = i["ssh_port"]
         host = i["ssh_host"]
         yield {
             "id": i["id"],
             "ssh_host": host,
             "ssh_port": port,
+            "status": i["status_msg"],
             "ssh": f"ssh root@{host} -p {port}"
         }
+
 
 def delete_instance(id):
     url = wrap_url(f"https://cloud.vast.ai/api/v0/instances/{id}/")
@@ -85,15 +93,15 @@ def delete_instance(id):
     print(r.json())
 
 if __name__ == "__main__":
-    if True:
+    if False:
         for index, i in enumerate(get_instances()):
             if 3 <= index:
                 print(i)
-              #  print(create_instance(
-               #     i["id"]
-               # ))
-                break    
+                print(create_instance(
+                    i["id"]
+                ))
+                break
     elif True:
         for i in get_instance():
-               print(i)
+            print(i)
 #            delete_instance(i["id"])
