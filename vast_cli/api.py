@@ -6,6 +6,7 @@ from urllib.parse import quote_plus
 
 load_dotenv()
 
+api_url = "https://cloud.vast.ai/api/v0/"
 
 def wrap_url(url, query_args={}):
     query_args["api_key"] = os.environ["API_KEY"]
@@ -14,14 +15,14 @@ def wrap_url(url, query_args={}):
         query_args.items()
     ])
 
-
-def get_instances():
+def get_available_instances():
     search = {
         "disk_space":
         {"gte": 16}, "verified":
         {"eq": True}, "rentable":
         {"eq": True},
         "num_gpus": {
+            # We want big machine
             "gte": 8,
             "lte": 16
         },
@@ -34,20 +35,17 @@ def get_instances():
         "type": "ask"  # bid or ask, ask = on - demand
     }
     q = json.dumps(search)
-    results = requests.get(
-        f"https://cloud.vast.ai/api/v0/bundles/?q={q}").json()
+    results = requests.get(f"{api_url}/bundles/?q={q}").json()
     print(results)
     for i in results["offers"]:
         yield {
             "id": i["id"],
             "num_gpus": i["num_gpus"],
             "price": i["dph_total"],
-            #            "type":i["type"]
         }
 
-
 def create_instance(id):
-    url = wrap_url(f"https://cloud.vast.ai/api/v0/asks/{id}/", {})
+    url = wrap_url(f"{api_url}/asks/{id}/", {})
     payload = {
         "client_id": "me",
         # images can be found here https://cloud.vast.ai/api/v0/users/undefined/templates/null/
@@ -69,12 +67,11 @@ def create_instance(id):
     print(response.json())
 
 
-def get_instance():
-    url = wrap_url("https://cloud.vast.ai/api/v0/instances/", {
+def get_running_instances():
+    url = wrap_url(f"{api_url}/instances/", {
         "owner": "me"
     })
     for i in requests.get(url).json()["instances"]:
- #      print(i)
         port = i["ssh_port"]
         host = i["ssh_host"]
         yield {
@@ -85,23 +82,8 @@ def get_instance():
             "ssh": f"ssh root@{host} -p {port}"
         }
 
-
 def delete_instance(id):
-    url = wrap_url(f"https://cloud.vast.ai/api/v0/instances/{id}/")
+    url = wrap_url(f"{api_url}/instances/{id}/")
     r = requests.delete(url, json={})
     print(r)
     print(r.json())
-
-if __name__ == "__main__":
-    if False:
-        for index, i in enumerate(get_instances()):
-            if 3 <= index:
-                print(i)
-                print(create_instance(
-                    i["id"]
-                ))
-                break
-    elif True:
-        for i in get_instance():
-            print(i)
-#            delete_instance(i["id"])
