@@ -15,7 +15,7 @@ def wrap_url(url, query_args={}):
         query_args.items()
     ])
 
-def get_available_instances():
+def get_available_instances(min_gpu=8):
     search = {
         "disk_space":
         {"gte": 16}, "verified":
@@ -23,7 +23,7 @@ def get_available_instances():
         {"eq": True},
         "num_gpus": {
             # We want big machine
-            "gte": 8,
+            "gte": min_gpu,
             "lte": 16
         },
         "order": [
@@ -81,6 +81,10 @@ def get_running_instances():
             "status": i["status_msg"],
             "ssh": f"ssh root@{host} -p {port}"
         }
+
+def stop_all_running_instances():
+    for i in get_running_instances():
+        delete_instance(i["id"])
 
 def delete_instance(id):
     url = wrap_url(f"{api_url}/instances/{id}/")
