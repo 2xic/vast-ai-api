@@ -15,12 +15,11 @@ def wrap_url(url, query_args={}):
         query_args.items()
     ])
 
-def get_available_instances(min_gpu=8):
+def get_available_instances(min_gpu=8, min_disk_space_gb=40):
     search = {
-        "disk_space":
-        {"gte": 16}, "verified":
-        {"eq": True}, "rentable":
-        {"eq": True},
+        "disk_space": {"gte": min_disk_space_gb}, 
+        "verified": {"eq": True}, 
+        "rentable": {"eq": True},
         "num_gpus": {
             # We want big machine
             "gte": min_gpu,
@@ -29,7 +28,7 @@ def get_available_instances(min_gpu=8):
         "order": [
             ["score", "desc"]
         ],
-        "allocated_storage": 16,
+        "allocated_storage": min_disk_space_gb,
         "cuda_max_good": {},
         "extra_ids": [],
         "type": "ask"  # bid or ask, ask = on - demand
@@ -42,9 +41,10 @@ def get_available_instances(min_gpu=8):
             "id": i["id"],
             "num_gpus": i["num_gpus"],
             "price": i["dph_total"],
+            "disk": min_disk_space_gb
         }
 
-def create_instance(id):
+def create_instance(id, disk):
     url = wrap_url(f"{api_url}/asks/{id}/", {})
     payload = {
         "client_id": "me",
@@ -60,12 +60,11 @@ def create_instance(id):
         "python_utf8": False,
         "lang_utf8": False,
         # size of local disk partition in GB
-        "disk": 10
+        "disk": disk
     }
     response = requests.put(url, json=payload)
     print(response)
     print(response.json())
-
 
 def get_running_instances():
     url = wrap_url(f"{api_url}/instances/", {
