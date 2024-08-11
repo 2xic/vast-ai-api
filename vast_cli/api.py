@@ -3,6 +3,8 @@ import json
 from dotenv import load_dotenv
 import os
 from urllib.parse import quote_plus
+from dataclasses import dataclass, field
+from typing import List
 
 load_dotenv()
 
@@ -44,13 +46,24 @@ def get_available_instances(min_gpu=8, min_disk_space_gb=40):
             "disk": min_disk_space_gb
         }
 
-def create_instance(id, disk):
+@dataclass
+class InstanceOptions:
+    # images can be found here https://cloud.vast.ai/api/v0/users/undefined/templates/null/
+    docker_image = "pytorch/pytorch"
+    # options to docker, i.e if you want to open a port
+    # ["-p 8081:8081", "-p 8082:8082"]
+    docker_options: List[str] = field(default_factory=list)
+    disk_space = 10 # gb
+
+def create_instance(id, options: InstanceOptions=InstanceOptions()):
     url = wrap_url(f"{api_url}/asks/{id}/", {})
+    docker_env = {}
+    for i in options.docker_options:
+        docker_env[i] = "1"
     payload = {
         "client_id": "me",
-        # images can be found here https://cloud.vast.ai/api/v0/users/undefined/templates/null/
-        "image": "pytorch/pytorch",
-        "env": {},
+        "image": options.docker_image,
+        "env": docker_env,
         "args_str": "",
         "onstart": "",
         "runtype": "ssh ssh_direc ssh_proxy",
@@ -60,7 +73,7 @@ def create_instance(id, disk):
         "python_utf8": False,
         "lang_utf8": False,
         # size of local disk partition in GB
-        "disk": disk
+        "disk": options.disk_space,
     }
     response = requests.put(url, json=payload)
     print(response)
@@ -70,15 +83,27 @@ def get_running_instances():
     url = wrap_url(f"{api_url}/instances/", {
         "owner": "me"
     })
-    for i in requests.get(url).json()["instances"]:
-        port = i["ssh_port"]
-        host = i["ssh_host"]
+    for instance in requests.get(url).json()["instances"]:
+        port = instance["ssh_port"]
+        host = instance["ssh_host"]
+        open_ports = instance.get("ports", [])
+        public_ip = instance["public_ipaddr"]
+        formatted_open_ports = []
+        for port_ref in open_ports:
+            # ipv4
+            entry = open_ports[port_ref][0]
+            formatted_open_ports.append(public_ip + ":" + entry["HostPort"] + " -> " + port_ref)
+        status = instance["actual_status"]
+
         yield {
-            "id": i["id"],
+            "id": instance["id"],
             "ssh_host": host,
             "ssh_port": port,
-            "status": i["status_msg"],
-            "ssh": f"ssh root@{host} -p {port}"
+            "status": instance["status_msg"],
+            "ssh": f"ssh root@{host} -p {port}",
+            "open_ports": formatted_open_ports,
+            "public_ip": public_ip,
+            "status": status
         }
 
 def stop_all_running_instances():
