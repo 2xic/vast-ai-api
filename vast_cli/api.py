@@ -11,39 +11,58 @@ load_dotenv()
 api_url = "https://cloud.vast.ai/api/v0/"
 
 def wrap_url(url, query_args={}):
-    query_args["api_key"] = os.environ["API_KEY"]
+    query_args["api_key"] = os.environ["VAST_API_KEY"]
     return url + "?" + "&".join([
         "{x}={y}".format(x=x, y=quote_plus(y if isinstance(y, str) else json.dumps(y))) for x, y in
         query_args.items()
     ])
 
-def get_available_instances(min_gpu=8, min_disk_space_gb=40):
+@dataclass
+class AvailableInstancesFilter:
+    min_gpu: int = 8
+    min_disk_space_gb: int = 40
+    max_dollar_price_hour: float = 10
+    # internet up and down
+    mbps_up: float = 10
+    mbps_down: float = 10
+
+def get_available_instances(options: AvailableInstancesFilter):
     search = {
-        "disk_space": {"gte": min_disk_space_gb}, 
+        "disk_space": {"gte": options.min_disk_space_gb}, 
         "verified": {"eq": True}, 
         "rentable": {"eq": True},
         "num_gpus": {
             # We want big machine
-            "gte": min_gpu,
+            "gte": options.min_gpu,
             "lte": 16
+        },
+        "dph_total": {
+            "lte": options.max_dollar_price_hour,
+        },
+        "inet_up": {
+            "gte": options.mbps_up,
+        },
+        "inet_down":{
+            "gte": options.mbps_down,
         },
         "order": [
             ["score", "desc"]
         ],
-        "allocated_storage": min_disk_space_gb,
+        "allocated_storage": options.min_disk_space_gb,
         "cuda_max_good": {},
         "extra_ids": [],
         "type": "ask"  # bid or ask, ask = on - demand
     }
     q = json.dumps(search)
     results = requests.get(f"{api_url}/bundles/?q={q}").json()
-    print(results)
     for i in results["offers"]:
         yield {
             "id": i["id"],
             "num_gpus": i["num_gpus"],
             "price": i["dph_total"],
-            "disk": min_disk_space_gb
+            "score": i["score"],
+            "disk": i["disk_space"],
+            "gpu_ram": i["gpu_ram"],
         }
 
 @dataclass
