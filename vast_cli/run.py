@@ -229,7 +229,8 @@ def _reset_node(inst, log):
     )
 
 
-def rerun(label, src=".", setup=None, paths=None, cmd=None):
+def rerun(label, src=".", setup=None, paths=None, cmd=None, grace=None,
+          max_age=None, drain=None):
     def log(m):
         print(f"[rerun:{label}] {m}")
 
@@ -249,9 +250,9 @@ def rerun(label, src=".", setup=None, paths=None, cmd=None):
         "label": label,
         "cmd": cmd,
         "launched_at": int(time.time()),
-        "grace_s": job["grace_s"],
-        "max_age_s": job["max_age_s"],
-        "drain_s": job["drain_s"],
+        "grace_s": grace if grace is not None else job["grace_s"],
+        "max_age_s": max_age if max_age is not None else job["max_age_s"],
+        "drain_s": drain if drain is not None else job["drain_s"],
     }
     _reset_node(inst, log)
     _push_and_start(inst, local_dir, cmd, job, setup, paths, log)

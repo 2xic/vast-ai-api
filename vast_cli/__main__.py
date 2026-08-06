@@ -74,6 +74,15 @@ def main():
         metavar="LOCAL[:REMOTE]",
         help="extra file/dir to push (repeatable)",
     )
+    rr.add_argument(
+        "--grace", type=int, default=None, help="override grace (default: reuse)"
+    )
+    rr.add_argument(
+        "--max-age", type=int, default=None, help="override max-age (default: reuse)"
+    )
+    rr.add_argument(
+        "--drain", type=int, default=None, help="override drain (default: reuse)"
+    )
 
     ex = sub.add_parser(
         "exec",
@@ -146,6 +155,9 @@ def main():
                 setup=args.setup,
                 paths=args.path,
                 cmd=args.cmd,
+                grace=args.grace,
+                max_age=args.max_age,
+                drain=args.drain,
             )
         except Exception as e:
             print(f"rerun failed: {e}", file=sys.stderr)
