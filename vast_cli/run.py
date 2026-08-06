@@ -61,7 +61,10 @@ def push_path(inst, spec):
     local = os.path.expanduser(local)
     if not os.path.exists(local):
         raise RuntimeError(f"--path source not found: {local}")
-    dest = dest or os.path.basename(os.path.normpath(local))
+    if os.path.isdir(local):
+        dest = dest or os.path.basename(os.path.normpath(local))
+    else:
+        dest = dest or "."
     if not dest.startswith("/"):
         dest = f"{REMOTE_DIR}/{dest}"
     remote.put(inst, local, dest)
@@ -130,6 +133,38 @@ def _provision_reachable(filter, options, label, log, pubkey, on_account, attemp
     raise RuntimeError("no reachable node within attempt budget")
 
 
+def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
+    log("pushing project files...")
+    push_dir(inst, local_dir)
+    for spec in paths or []:
+        log(f"pushing {spec}")
+        push_path(inst, spec)
+    if setup:
+        log("running setup...")
+        rc, out, err = remote.run(inst, f"cd {REMOTE_DIR} && {setup}", timeout=1800)
+        if rc != 0:
+            raise RuntimeError(f"setup failed (rc={rc}): {err or out}")
+    log("writing JOB marker and starting detached job...")
+    b = base64.b64encode(json.dumps(job).encode()).decode()
+    remote.run(inst, f"echo {b} | base64 -d > {REMOTE_DIR}/JOB", timeout=60)
+    start = (
+        f"cd {REMOTE_DIR} && "
+        f'setsid sh -c \'echo $$ > PGID; trap "" TERM; '
+        f"[ -f .env ] && . ./.env; "
+        f"{cmd} > run.log 2>&1; echo $? > DONE' "
+        f"</dev/null >/dev/null 2>&1 & exit 0"
+    )
+    remote.run(inst, start, timeout=30)
+    pgid = ""
+    for _ in range(10):
+        pgid = remote.run(inst, f"cat {REMOTE_DIR}/PGID 2>/dev/null", timeout=30)[1]
+        if pgid.strip():
+            break
+        time.sleep(1)
+    if not pgid.strip():
+        raise RuntimeError("failed to start detached job (no PGID marker)")
+
+
 def launch(
     src,
     cmd,
@@ -173,41 +208,55 @@ def launch(
         filter, options, label, log, pubkey, on_account
     )
     try:
-        log("ssh up; pushing project files...")
-        push_dir(inst, local_dir)
-        for spec in paths or []:
-            log(f"pushing {spec}")
-            push_path(inst, spec)
-        if setup:
-            log("running setup...")
-            rc, out, err = remote.run(inst, f"cd {REMOTE_DIR} && {setup}", timeout=1800)
-            if rc != 0:
-                raise RuntimeError(f"setup failed (rc={rc}): {err or out}")
-        log("writing JOB marker and starting detached job...")
-        b = base64.b64encode(json.dumps(job).encode()).decode()
-        remote.run(inst, f"echo {b} | base64 -d > {REMOTE_DIR}/JOB", timeout=60)
-        start = (
-            f"cd {REMOTE_DIR} && "
-            f'setsid sh -c \'echo $$ > PGID; trap "" TERM; '
-            f"[ -f .env ] && . ./.env; "
-            f"{cmd} > run.log 2>&1; echo $? > DONE' "
-            f"</dev/null >/dev/null 2>&1 & exit 0"
-        )
-        remote.run(inst, start, timeout=30)
-        pgid = ""
-        for _ in range(10):
-            pgid = remote.run(inst, f"cat {REMOTE_DIR}/PGID 2>/dev/null", timeout=30)[1]
-            if pgid.strip():
-                break
-            time.sleep(1)
-        if not pgid.strip():
-            raise RuntimeError("failed to start detached job (no PGID marker)")
+        log("ssh up")
+        _push_and_start(inst, local_dir, cmd, job, setup, paths, log)
     except (Exception, KeyboardInterrupt) as e:
         log(f"launch aborted ({e!r}); destroying node")
         destroy_with_retries(inst_id)
         raise
     log(f"job running on {inst_id} ({inst['ssh']}); the reaper owns teardown now")
     return inst_id
+
+
+def _reset_node(inst, log):
+    log("killing previous job and clearing markers...")
+    remote.run(
+        inst,
+        f"kill -KILL -$(cat {REMOTE_DIR}/PGID) 2>/dev/null; "
+        f"rm -f {REMOTE_DIR}/DONE {REMOTE_DIR}/SHUTDOWN "
+        f"{REMOTE_DIR}/DRAINING {REMOTE_DIR}/PGID",
+        timeout=30,
+    )
+
+
+def rerun(label, src=".", setup=None, paths=None, cmd=None):
+    def log(m):
+        print(f"[rerun:{label}] {m}")
+
+    existing = _find_existing(label)
+    if not existing:
+        raise RuntimeError(
+            f"no running node labelled {LABEL_PREFIX}{label}; use launch first"
+        )
+    inst = existing[0]
+    prev = _probe(inst)
+    if not prev or not prev["job"]:
+        raise RuntimeError("node has no JOB marker; use launch instead")
+    job = prev["job"]
+    cmd = cmd or job["cmd"]
+    local_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
+    job = {
+        "label": label,
+        "cmd": cmd,
+        "launched_at": int(time.time()),
+        "grace_s": job["grace_s"],
+        "max_age_s": job["max_age_s"],
+        "drain_s": job["drain_s"],
+    }
+    _reset_node(inst, log)
+    _push_and_start(inst, local_dir, cmd, job, setup, paths, log)
+    log(f"rerunning on {inst['id']} ({inst['ssh']}); cmd: {cmd}")
+    return inst["id"]
 
 
 PROBE = (
@@ -250,6 +299,19 @@ def _ours(inst):
 def _find_existing(label):
     want = LABEL_PREFIX + label
     return [i for i in get_running_instances() if (i.get("label") or "") == want]
+
+
+def exec_on(label, cmd=None):
+    matches = _find_existing(label)
+    if not matches:
+        raise RuntimeError(f"no running node labelled {label!r}")
+    if len(matches) > 1:
+        ids = ", ".join(str(i["id"]) for i in matches)
+        raise RuntimeError(f"multiple nodes labelled {label!r}: {ids}")
+    inst = matches[0]
+    if cmd:
+        return remote.shell(inst, f"cd {REMOTE_DIR} && {cmd}")
+    return remote.shell(inst, f"cd {REMOTE_DIR}; exec bash -l", tty=True)
 
 
 def _managed():

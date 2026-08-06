@@ -40,6 +40,12 @@ def base(inst):
     return ["ssh", *SSH_OPTS, "-p", str(inst["ssh_port"]), f"root@{inst['ssh_host']}"]
 
 
+def shell(inst, cmd, tty=False):
+    ssh, rest = base(inst)[:1], base(inst)[1:]
+    opts = ["-t"] if tty else []
+    return subprocess.call([*ssh, *opts, *rest, cmd])
+
+
 def run(inst, cmd, timeout=None):
     try:
         p = subprocess.run(

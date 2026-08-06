@@ -3,7 +3,7 @@ import os
 import sys
 
 from vast_cli.api import AvailableInstancesFilter, InstanceOptions
-from vast_cli.run import clean, launch, list_gpus, ps, reap
+from vast_cli.run import clean, exec_on, launch, list_gpus, ps, reap, rerun
 
 
 def main():
@@ -51,6 +51,31 @@ def main():
         default=[],
         metavar="LOCAL[:REMOTE]",
         help="extra file/dir to push (repeatable); REMOTE relative to the project dir",
+    )
+
+    rr = sub.add_parser(
+        "rerun",
+        help="re-push files and restart the job on an existing node (edit-run loop)",
+    )
+    rr.add_argument("label", help="label of the running node to rerun on")
+    rr.add_argument("src", nargs="?", default=".", help="local dir to re-push")
+    rr.add_argument("--cmd", default=None, help="override the command (default: reuse)")
+    rr.add_argument("--setup", default=None, help="command run once before the job")
+    rr.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="LOCAL[:REMOTE]",
+        help="extra file/dir to push (repeatable)",
+    )
+
+    ex = sub.add_parser(
+        "exec",
+        help="run a shell command on a labelled node (no cmd = interactive shell)",
+    )
+    ex.add_argument("label", help="label of the node to run on")
+    ex.add_argument(
+        "cmd", nargs=argparse.REMAINDER, help="command (default: interactive)"
     )
 
     r = sub.add_parser(
@@ -105,6 +130,20 @@ def main():
         except Exception as e:
             print(f"launch failed: {e}", file=sys.stderr)
             sys.exit(1)
+    elif args.command == "rerun":
+        try:
+            rerun(
+                args.label,
+                src=args.src,
+                setup=args.setup,
+                paths=args.path,
+                cmd=args.cmd,
+            )
+        except Exception as e:
+            print(f"rerun failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "exec":
+        sys.exit(exec_on(args.label, cmd=" ".join(args.cmd) or None))
     elif args.command == "reap":
         reap(default_max_age=args.max_age)
     elif args.command == "ps":
