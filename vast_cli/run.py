@@ -141,9 +141,9 @@ def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
         push_path(inst, spec)
     if setup:
         log("running setup...")
-        rc, out, err = remote.run(inst, f"cd {REMOTE_DIR} && {setup}", timeout=1800)
+        rc = remote.shell(inst, f"cd {REMOTE_DIR} && {setup}")
         if rc != 0:
-            raise RuntimeError(f"setup failed (rc={rc}): {err or out}")
+            raise RuntimeError(f"setup failed (rc={rc})")
     log("writing JOB marker and starting detached job...")
     b = base64.b64encode(json.dumps(job).encode()).decode()
     remote.run(inst, f"echo {b} | base64 -d > {REMOTE_DIR}/JOB", timeout=60)

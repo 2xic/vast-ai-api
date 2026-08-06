@@ -26,6 +26,12 @@ def main():
         "--gpu", default=None, metavar="NAME", help="exact GPU model, e.g. 'H100 SXM'"
     )
     launch_p.add_argument("--disk", type=int, default=10)
+    launch_p.add_argument(
+        "--image",
+        default=None,
+        metavar="REPO:TAG",
+        help="docker image, e.g. 'pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime'",
+    )
     launch_p.add_argument("--price", type=float, default=10.0)
     launch_p.add_argument("--up", type=float, default=10.0)
     launch_p.add_argument("--down", type=float, default=10.0)
@@ -113,6 +119,8 @@ def main():
         )
         options = InstanceOptions()
         options.disk_space = args.disk
+        if args.image:
+            options.docker_image = args.image
         label = args.label or os.path.basename(os.path.normpath(args.src))
         try:
             launch(
