@@ -102,6 +102,12 @@ def main():
         default=86400,
         help="destroy an unreachable managed node older than this",
     )
+    r.add_argument(
+        "--max-restarts",
+        type=int,
+        default=3,
+        help="relaunch a crashed job (no DONE, dead pgid) up to this many times",
+    )
 
     sub.add_parser(
         "ps",
@@ -165,7 +171,7 @@ def main():
     elif args.command == "exec":
         sys.exit(exec_on(args.label, cmd=" ".join(args.cmd) or None))
     elif args.command == "reap":
-        reap(default_max_age=args.max_age)
+        reap(default_max_age=args.max_age, max_restarts=args.max_restarts)
     elif args.command == "ps":
         ps()
     elif args.command == "clean":

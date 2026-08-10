@@ -18,6 +18,42 @@ from vast_cli.api import (
 
 REMOTE_DIR = "/root/proj"
 LABEL_PREFIX = "vrun:"
+LAUNCH_GRACE_S = 1800
+HEARTBEAT_STALE_S = 90
+
+JOB_SH = (
+    "#!/bin/sh\n"
+    'cd "$(dirname "$0")"\n'
+    "touch HEARTBEAT\n"
+    "echo $$ > PGID\n"
+    "( trap '' TERM; while :; do touch HEARTBEAT; sleep 20; done ) &\n"
+    "HB=$!\n"
+    "trap true TERM\n"
+    "[ -f .env ] && . ./.env\n"
+    "sh run.sh > run.log 2>&1\n"
+    "rc=$?\n"
+    'kill "$HB" 2>/dev/null\n'
+    "echo $rc > DONE\n"
+)
+
+
+def _put_file(inst, name, content):
+    b = base64.b64encode(content.encode()).decode()
+    remote.run(
+        inst,
+        f"mkdir -p {REMOTE_DIR} && echo {b} | base64 -d > {REMOTE_DIR}/{name}",
+        timeout=60,
+    )
+
+
+def _killgroup(sig):
+    return (
+        f"P=$(cat {REMOTE_DIR}/PGID 2>/dev/null); "
+        f'[ -n "$P" ] && for d in /proc/[0-9]*; do '
+        f'g=$(sed "s/.*) //" "$d/stat" 2>/dev/null | cut -d" " -f3); '
+        f'[ "$g" = "$P" ] && kill -{sig} "${{d#/proc/}}" 2>/dev/null; '
+        "done"
+    )
 
 
 def _local_pubkey():
@@ -77,13 +113,16 @@ def destroy_with_retries(inst_id, attempts=5, backoff=3):
             print(f"[teardown] destroyed instance {inst_id}")
             return True
         except Exception as e:
+            if "no_such_instance" in str(e):
+                print(f"[teardown] instance {inst_id} already gone")
+                return True
             print(f"[teardown] destroy attempt {attempt}/{attempts} failed: {e}")
             time.sleep(backoff * attempt)
-    key = os.environ.get("VAST_API_KEY", "$VAST_API_KEY")
     print("=" * 70)
     print(f"!!! FAILED TO DESTROY INSTANCE {inst_id} - IT MAY STILL BE BILLING !!!")
     print(
-        f"  curl -X DELETE 'https://cloud.vast.ai/api/v0/instances/{inst_id}/?api_key={key}'"
+        f"  curl -X DELETE "
+        f"'https://cloud.vast.ai/api/v0/instances/{inst_id}/?api_key=$VAST_API_KEY'"
     )
     print("=" * 70)
     return False
@@ -134,6 +173,13 @@ def _provision_reachable(filter, options, label, log, pubkey, on_account, attemp
 
 
 def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
+    log("writing JOB marker...")
+    b = base64.b64encode(json.dumps(job).encode()).decode()
+    remote.run(
+        inst,
+        f"mkdir -p {REMOTE_DIR} && echo {b} | base64 -d > {REMOTE_DIR}/JOB",
+        timeout=60,
+    )
     log("pushing project files...")
     push_dir(inst, local_dir)
     for spec in paths or []:
@@ -144,25 +190,24 @@ def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
         rc = remote.shell(inst, f"cd {REMOTE_DIR} && {setup}")
         if rc != 0:
             raise RuntimeError(f"setup failed (rc={rc})")
-    log("writing JOB marker and starting detached job...")
-    b = base64.b64encode(json.dumps(job).encode()).decode()
-    remote.run(inst, f"echo {b} | base64 -d > {REMOTE_DIR}/JOB", timeout=60)
-    start = (
-        f"cd {REMOTE_DIR} && "
-        f'setsid sh -c \'echo $$ > PGID; trap "" TERM; '
-        f"[ -f .env ] && . ./.env; "
-        f"{cmd} > run.log 2>&1; echo $? > DONE' "
-        f"</dev/null >/dev/null 2>&1 & exit 0"
+    log("starting detached job...")
+    _start_detached(inst, cmd)
+
+
+def _start_detached(inst, cmd):
+    _put_file(inst, "run.sh", cmd)
+    _put_file(inst, "job.sh", JOB_SH)
+    remote.run(
+        inst,
+        f"cd {REMOTE_DIR} && setsid sh job.sh </dev/null >/dev/null 2>&1 & exit 0",
+        timeout=30,
     )
-    remote.run(inst, start, timeout=30)
-    pgid = ""
     for _ in range(10):
         pgid = remote.run(inst, f"cat {REMOTE_DIR}/PGID 2>/dev/null", timeout=30)[1]
         if pgid.strip():
-            break
+            return
         time.sleep(1)
-    if not pgid.strip():
-        raise RuntimeError("failed to start detached job (no PGID marker)")
+    raise RuntimeError("failed to start detached job (no PGID marker)")
 
 
 def launch(
@@ -222,9 +267,9 @@ def _reset_node(inst, log):
     log("killing previous job and clearing markers...")
     remote.run(
         inst,
-        f"kill -KILL -$(cat {REMOTE_DIR}/PGID) 2>/dev/null; "
+        f"{_killgroup('KILL')}; "
         f"rm -f {REMOTE_DIR}/DONE {REMOTE_DIR}/SHUTDOWN "
-        f"{REMOTE_DIR}/DRAINING {REMOTE_DIR}/PGID",
+        f"{REMOTE_DIR}/DRAINING {REMOTE_DIR}/PGID {REMOTE_DIR}/HEARTBEAT",
         timeout=30,
     )
 
@@ -238,6 +283,11 @@ def rerun(label, src=".", setup=None, paths=None, cmd=None, grace=None,
     if not existing:
         raise RuntimeError(
             f"no running node labelled {LABEL_PREFIX}{label}; use launch first"
+        )
+    if len(existing) > 1:
+        ids = ", ".join(str(i["id"]) for i in existing)
+        raise RuntimeError(
+            f"multiple nodes labelled {LABEL_PREFIX}{label}: {ids}; destroy extras"
         )
     inst = existing[0]
     prev = _probe(inst)
@@ -266,29 +316,43 @@ PROBE = (
     f"M=$(stat -c %Y {REMOTE_DIR}/DONE 2>/dev/null || echo -); "
     f"H=$([ -f {REMOTE_DIR}/HOLD ] && echo 1 || echo 0); "
     f"R=$(cat {REMOTE_DIR}/DRAINING 2>/dev/null || echo -); "
-    f'printf \'%s|%s|%s|%s|%s\' "$J" "$D" "$M" "$H" "$R"'
+    f"P=$(cat {REMOTE_DIR}/PGID 2>/dev/null); "
+    f'G=$([ -n "$P" ] && echo 1 || echo 0); '
+    f"HB=$(stat -c %Y {REMOTE_DIR}/HEARTBEAT 2>/dev/null || echo -); "
+    f'A=$([ "$HB" != "-" ] && echo $(($(date +%s) - HB)) || echo -); '
+    f"C=$(cat {REMOTE_DIR}/RESTARTS 2>/dev/null || echo 0); "
+    f"printf 'job=%s\\ndone=%s\\nmtime=%s\\nhold=%s\\n"
+    f"drain=%s\\nhas_pgid=%s\\nhb_age=%s\\nrestarts=%s\\n' "
+    f'"$J" "$D" "$M" "$H" "$R" "$G" "$A" "$C"'
 )
 
 
 def _probe(inst):
-    rc, out, _ = remote.run(inst, PROBE)
+    rc, out, _ = remote.run(inst, PROBE, timeout=45)
     if rc != 0:
         return None
-    j, done, mtime, hold, drain = [*out.split("|"), "", "-", "-", "0", "-"][:5]
-    job = json.loads(base64.b64decode(j)) if j else None
-    return {
-        "job": job,
-        "done": done,
-        "mtime": mtime,
-        "hold": hold == "1",
-        "drain": drain,
-    }
+    try:
+        f = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        job = json.loads(base64.b64decode(f["job"])) if f["job"] else None
+        hb = f["hb_age"]
+        return {
+            "job": job,
+            "done": f["done"],
+            "mtime": f["mtime"],
+            "hold": f["hold"] == "1",
+            "drain": f["drain"],
+            "has_pgid": f["has_pgid"] == "1",
+            "alive": hb != "-" and int(hb) < HEARTBEAT_STALE_S,
+            "restarts": int(f["restarts"] or 0),
+        }
+    except Exception:
+        return None
 
 
 def _signal_shutdown(inst, deadline):
     remote.run(
         inst,
-        f"kill -TERM -$(cat {REMOTE_DIR}/PGID) 2>/dev/null; "
+        f"{_killgroup('TERM')}; "
         f"touch {REMOTE_DIR}/SHUTDOWN; echo {deadline} > {REMOTE_DIR}/DRAINING",
     )
 
@@ -333,7 +397,27 @@ def _state(p):
     return "exited"
 
 
-def _decide(inst, p, now, default_max_age):
+def _decide_running(p, now, max_restarts):
+    j = p["job"]
+    if not p["has_pgid"]:
+        if now - j["launched_at"] > LAUNCH_GRACE_S:
+            return "destroy", "no PGID long after launch (launch died)"
+        return None, "launching, no PGID yet"
+    if not p["alive"]:
+        if p["restarts"] < max_restarts:
+            return "restart", (
+                f"job died with no DONE, relaunching "
+                f"({p['restarts'] + 1}/{max_restarts})"
+            )
+        if p["hold"]:
+            return None, f"died, exhausted {max_restarts} restarts, HOLD set"
+        return "destroy", f"died, exhausted {max_restarts} restarts"
+    if now - j["launched_at"] > j["max_age_s"]:
+        return "signal", "exceeded max_age, sending shutdown heads-up"
+    return None, None
+
+
+def _decide(inst, p, now, default_max_age, max_restarts):
     state = _state(p)
     if state == "unreachable":
         age = now - int(inst["start_date"]) if inst.get("start_date") else 0
@@ -343,7 +427,10 @@ def _decide(inst, p, now, default_max_age):
             else (None, "unreachable, skipping")
         )
     if state == "half-launched":
-        return "destroy", "half-launched (no JOB)"
+        age = now - int(inst["start_date"]) if inst.get("start_date") else 0
+        if age > LAUNCH_GRACE_S:
+            return "destroy", "half-launched (no JOB) past grace"
+        return None, "half-launched, within launch grace"
     if state == "draining":
         if p["done"] != "-":
             return "destroy", f"exited (code {p['done']}) after heads-up"
@@ -351,10 +438,7 @@ def _decide(inst, p, now, default_max_age):
             return "destroy", "ignored SIGTERM past deadline"
         return None, f"draining, {int(p['drain']) - now}s left"
     if state == "running":
-        j = p["job"]
-        if now - j["launched_at"] > j["max_age_s"]:
-            return "signal", "exceeded max_age, sending shutdown heads-up"
-        return None, None
+        return _decide_running(p, now, max_restarts)
     code, grace, ago = int(p["done"]), p["job"]["grace_s"], now - int(p["mtime"])
     if code == 0:
         return "destroy", "succeeded"
@@ -365,27 +449,48 @@ def _decide(inst, p, now, default_max_age):
     return None, f"failed (exit {code}), {grace - ago}s grace left"
 
 
-def _reap_one(inst, now, default_max_age):
+def _restart_job(inst, cmd):
+    remote.run(
+        inst,
+        f"{_killgroup('KILL')}; "
+        f"cd {REMOTE_DIR} && rm -f DONE SHUTDOWN DRAINING PGID HEARTBEAT && "
+        f"C=$(cat RESTARTS 2>/dev/null || echo 0) && echo $((C + 1)) > RESTARTS",
+        timeout=30,
+    )
+    _start_detached(inst, cmd)
+
+
+def _reap_one(inst, now, default_max_age, max_restarts):
     p = _probe(inst)
     label = p["job"]["label"] if p and p["job"] else inst.get("label")
-    action, msg = _decide(inst, p, now, default_max_age)
+    action, msg = _decide(inst, p, now, default_max_age, max_restarts)
     if msg:
         print(f"[reap] {label} {msg}{', destroying' if action == 'destroy' else ''}")
     if action == "destroy":
         destroy_with_retries(inst["id"])
     elif action == "signal":
         _signal_shutdown(inst, now + p["job"]["drain_s"])
+    elif action == "restart":
+        _restart_job(inst, p["job"]["cmd"])
 
 
-def reap(default_max_age=86400):
+def reap(default_max_age=86400, max_restarts=3):
     now = int(time.time())
+    managed = failed = 0
     for inst in get_running_instances():
         if not _ours(inst):
             continue
+        managed += 1
         try:
-            _reap_one(inst, now, default_max_age)
+            _reap_one(inst, now, default_max_age, max_restarts)
         except Exception as e:
+            failed += 1
             print(f"[reap] {inst['id']} error, skipping this tick: {e!r}")
+    if managed and failed == managed:
+        raise RuntimeError(
+            f"reap failed on all {managed} managed node(s); environment likely "
+            f"broken (is ssh/tar on the service PATH?)"
+        )
 
 
 def list_gpus(max_price=1000.0, min_gpu=1):
@@ -414,10 +519,41 @@ def clean(force=False):
         destroy_with_retries(inst["id"])
 
 
+def _fmt_dur(s):
+    if s <= 0:
+        return "expired"
+    h, rem = divmod(s, 3600)
+    m, _ = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m" if m else f"{s}s"
+
+
+def _lifetime(p, now):
+    if not p or not p["job"]:
+        return "-"
+    j = p["job"]
+    return _fmt_dur(j["max_age_s"] - (now - j["launched_at"]))
+
+
+def _age(inst, p, now):
+    if p and p["job"]:
+        return _fmt_dur(now - p["job"]["launched_at"])
+    if inst.get("start_date"):
+        return _fmt_dur(now - int(inst["start_date"]))
+    return "-"
+
+
 def ps():
+    now = int(time.time())
     for inst, p in _managed():
         state = _state(p)
         if state == "exited":
             state += f"({p['done']})" + (" HOLD" if p["hold"] else "")
         label = (inst.get("label") or "")[len(LABEL_PREFIX) :]
-        print(f"{inst['id']:>10}  {label:<20} {state}")
+        age, left = _age(inst, p, now), _lifetime(p, now)
+        restarts = f" restarts {p['restarts']}" if p and p.get("restarts") else ""
+        print(
+            f"{inst['id']:>10}  {label:<20} {state:<18} "
+            f"up {age:<7} left {left}{restarts}"
+        )
