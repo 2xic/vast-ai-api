@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 load_dotenv()
+
+logger = logging.getLogger("vast_cli")
 
 api_url = "https://cloud.vast.ai/api/v0/"
 
@@ -101,7 +104,7 @@ class InstanceOptions:
     disk_space = 10  # gb
 
 
-def create_instance(id, options: InstanceOptions = None, label=None):
+def create_instance(offer_id, options: InstanceOptions = None, label=None):
     options = options or InstanceOptions()
     payload = {
         "client_id": "me",
@@ -118,7 +121,7 @@ def create_instance(id, options: InstanceOptions = None, label=None):
         "disk": options.disk_space,
         "label": label,
     }
-    url = wrap_url(f"{api_url}/asks/{id}/")
+    url = wrap_url(f"{api_url}/asks/{offer_id}/")
     return _api("PUT", url, "create_instance", json=payload)["new_contract"]
 
 
@@ -156,30 +159,48 @@ def wait_until_ready(instance_id, timeout=600, poll=10, log=None):
     raise TimeoutError(f"instance {instance_id} not ready within {timeout}s")
 
 
+def _fmt_ports(public_ip, ports):
+    out = []
+    for ref, p in ports.items():
+        try:
+            out.append(f"{public_ip}:{p[0]['HostPort']} -> {ref}")
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out
+
+
+def _instance_row(instance):
+    host = instance.get("ssh_host")
+    port = instance.get("ssh_port")
+    public_ip = instance.get("public_ipaddr")
+    return {
+        "id": instance["id"],
+        "ssh_host": host,
+        "ssh_port": port,
+        "ssh": f"ssh root@{host} -p {port}",
+        "open_ports": _fmt_ports(public_ip, instance.get("ports") or {}),
+        "public_ip": public_ip,
+        "status": instance.get("actual_status"),
+        "label": instance.get("label"),
+        "start_date": instance.get("start_date"),
+    }
+
+
 def get_running_instances():
     url = wrap_url(f"{api_url}/instances/", {"owner": "me"})
     body = _request("GET", url)
     if body.get("instances") is None:
         raise RuntimeError(f"list instances failed: {body}")
     for instance in body["instances"]:
-        host, port = instance["ssh_host"], instance["ssh_port"]
-        public_ip = instance["public_ipaddr"]
-        ports = instance.get("ports") or {}
-        yield {
-            "id": instance["id"],
-            "ssh_host": host,
-            "ssh_port": port,
-            "ssh": f"ssh root@{host} -p {port}",
-            "open_ports": [
-                f"{public_ip}:{p[0]['HostPort']} -> {ref}" for ref, p in ports.items()
-            ],
-            "public_ip": public_ip,
-            "status": instance["actual_status"],
-            "label": instance.get("label"),
-            "start_date": instance.get("start_date"),
-        }
+        try:
+            row = _instance_row(instance)
+        except Exception as e:
+            ref = instance.get("id") if isinstance(instance, dict) else instance
+            logger.warning("[instances] skipping malformed entry %r: %s", ref, e)
+            continue
+        yield row
 
 
-def delete_instance(id):
-    url = wrap_url(f"{api_url}/instances/{id}/")
+def delete_instance(instance_id):
+    url = wrap_url(f"{api_url}/instances/{instance_id}/")
     return _api("DELETE", url, "delete_instance", json={})

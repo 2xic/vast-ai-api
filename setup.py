@@ -5,6 +5,7 @@ setup(
     version='0.1.1',
     packages=[
         "vast_cli",
+        "vast_cli.api",
     ],
     install_requires=[
         "requests",

@@ -12,6 +12,10 @@ SSH_OPTS = [
     "LogLevel=ERROR",
     "-o",
     "ConnectTimeout=15",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
 ]
 
 
@@ -41,9 +45,9 @@ def base(inst):
 
 
 def shell(inst, cmd, tty=False):
-    ssh, rest = base(inst)[:1], base(inst)[1:]
+    cmd_ssh, *rest = base(inst)
     opts = ["-t"] if tty else []
-    return subprocess.call([*ssh, *opts, *rest, cmd])
+    return subprocess.call([cmd_ssh, *opts, *rest, cmd])
 
 
 def run(inst, cmd, timeout=None):

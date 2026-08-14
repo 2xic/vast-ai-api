@@ -1,10 +1,11 @@
 import base64
 import json
+import logging
 import os
 import time
 
-from vast_cli import remote
-from vast_cli.api import (
+from vast_cli.api import remote
+from vast_cli.api.client import (
     AvailableInstancesFilter,
     InstanceOptions,
     attach_ssh_key,
@@ -21,6 +22,8 @@ LABEL_PREFIX = "vrun:"
 LAUNCH_GRACE_S = 1800
 HEARTBEAT_STALE_S = 90
 
+logger = logging.getLogger("vast_cli")
+
 JOB_SH = (
     "#!/bin/sh\n"
     'cd "$(dirname "$0")"\n'
@@ -32,18 +35,23 @@ JOB_SH = (
     "[ -f .env ] && . ./.env\n"
     "sh run.sh > run.log 2>&1\n"
     "rc=$?\n"
-    'kill "$HB" 2>/dev/null\n'
+    'kill -KILL "$HB" 2>/dev/null\n'
     "echo $rc > DONE\n"
 )
 
 
 def _put_file(inst, name, content):
     b = base64.b64encode(content.encode()).decode()
-    remote.run(
+    return remote.run(
         inst,
         f"mkdir -p {REMOTE_DIR} && echo {b} | base64 -d > {REMOTE_DIR}/{name}",
         timeout=60,
-    )
+    )[0]
+
+
+def _write_job(inst, job):
+    if _put_file(inst, "JOB", json.dumps(job)) != 0:
+        raise RuntimeError("failed to write JOB marker")
 
 
 def _killgroup(sig):
@@ -56,7 +64,7 @@ def _killgroup(sig):
     )
 
 
-def _local_pubkey():
+def local_pubkey():
     for name in ("id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub"):
         p = os.path.expanduser(f"~/.ssh/{name}")
         if os.path.exists(p):
@@ -84,7 +92,7 @@ def _account_pubkeys():
     ]
 
 
-def _key_on_account(pubkey):
+def key_on_account(pubkey):
     return any(_key_id(k) == _key_id(pubkey) for k in _account_pubkeys())
 
 
@@ -110,30 +118,31 @@ def destroy_with_retries(inst_id, attempts=5, backoff=3):
     for attempt in range(1, attempts + 1):
         try:
             delete_instance(inst_id)
-            print(f"[teardown] destroyed instance {inst_id}")
+            logger.info("[teardown] destroyed instance %s", inst_id)
             return True
         except Exception as e:
             if "no_such_instance" in str(e):
-                print(f"[teardown] instance {inst_id} already gone")
+                logger.info("[teardown] instance %s already gone", inst_id)
                 return True
-            print(f"[teardown] destroy attempt {attempt}/{attempts} failed: {e}")
+            logger.warning(
+                "[teardown] destroy attempt %s/%s failed: %s", attempt, attempts, e
+            )
             time.sleep(backoff * attempt)
-    print("=" * 70)
-    print(f"!!! FAILED TO DESTROY INSTANCE {inst_id} - IT MAY STILL BE BILLING !!!")
-    print(
-        f"  curl -X DELETE "
-        f"'https://cloud.vast.ai/api/v0/instances/{inst_id}/?api_key=$VAST_API_KEY'"
+    logger.error("%s", "=" * 70)
+    logger.error(
+        "!!! FAILED TO DESTROY INSTANCE %s - IT MAY STILL BE BILLING !!!", inst_id
     )
-    print("=" * 70)
+    logger.error(
+        "  curl -X DELETE "
+        "'https://cloud.vast.ai/api/v0/instances/%s/?api_key=$VAST_API_KEY'",
+        inst_id,
+    )
+    logger.error("%s", "=" * 70)
     return False
 
 
-def _confirm(prompt):
-    return input(prompt).strip().lower() in ("y", "yes")
-
-
-def _rent_offer(filter: AvailableInstancesFilter, options, label, log):
-    for offer in get_available_instances(filter):
+def _rent_offer(filters: AvailableInstancesFilter, options, label, log):
+    for offer in get_available_instances(filters):
         log(
             f"offer {offer['id']} ({offer['num_gpus']}x {offer['gpu']}, "
             f"${offer['price']}/h)"
@@ -148,9 +157,9 @@ def _rent_offer(filter: AvailableInstancesFilter, options, label, log):
     raise RuntimeError("no available offer could be rented (all matches taken)")
 
 
-def _provision_reachable(filter, options, label, log, pubkey, on_account, attempts=3):
+def _provision_reachable(filters, options, label, log, pubkey, on_account, attempts=3):
     for attempt in range(1, attempts + 1):
-        inst_id = _rent_offer(filter, options, label, log)
+        inst_id = _rent_offer(filters, options, label, log)
         try:
             if not on_account:
                 attach_ssh_key(inst_id, pubkey)
@@ -174,12 +183,7 @@ def _provision_reachable(filter, options, label, log, pubkey, on_account, attemp
 
 def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
     log("writing JOB marker...")
-    b = base64.b64encode(json.dumps(job).encode()).decode()
-    remote.run(
-        inst,
-        f"mkdir -p {REMOTE_DIR} && echo {b} | base64 -d > {REMOTE_DIR}/JOB",
-        timeout=60,
-    )
+    _write_job(inst, job)
     log("pushing project files...")
     push_dir(inst, local_dir)
     for spec in paths or []:
@@ -213,7 +217,7 @@ def _start_detached(inst, cmd):
 def launch(
     src,
     cmd,
-    filter: AvailableInstancesFilter,
+    filters: AvailableInstancesFilter,
     options: InstanceOptions,
     label,
     setup=None,
@@ -221,9 +225,10 @@ def launch(
     max_age=86400,
     drain=1800,
     paths=None,
+    attach_missing_key=False,
 ):
     def log(m):
-        print(f"[launch:{label}] {m}")
+        logger.info("[launch:%s] %s", label, m)
 
     local_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
     job = {
@@ -241,16 +246,15 @@ def launch(
             f"a node labelled {LABEL_PREFIX}{label} already exists ({ids}); "
             f"destroy it or pick a new --label before relaunching"
         )
-    pubkey = _local_pubkey()
-    on_account = _key_on_account(pubkey)
-    if not on_account:
-        log(f"this ssh key is NOT on your vast account:\n  {pubkey}")
-        if not _confirm(f"[launch:{label}] attach it so the node is reachable? [y/N] "):
-            raise RuntimeError(
-                "aborted: no ssh key attached, the node would be unreachable"
-            )
+    pubkey = local_pubkey()
+    on_account = key_on_account(pubkey)
+    if not on_account and not attach_missing_key:
+        raise RuntimeError(
+            f"ssh key not on vast account ({pubkey}); pass attach_missing_key=True "
+            f"to attach it, else the node would be unreachable"
+        )
     inst_id, inst = _provision_reachable(
-        filter, options, label, log, pubkey, on_account
+        filters, options, label, log, pubkey, on_account
     )
     try:
         log("ssh up")
@@ -268,8 +272,8 @@ def _reset_node(inst, log):
     remote.run(
         inst,
         f"{_killgroup('KILL')}; "
-        f"rm -f {REMOTE_DIR}/DONE {REMOTE_DIR}/SHUTDOWN "
-        f"{REMOTE_DIR}/DRAINING {REMOTE_DIR}/PGID {REMOTE_DIR}/HEARTBEAT",
+        f"rm -f {REMOTE_DIR}/DONE {REMOTE_DIR}/SHUTDOWN {REMOTE_DIR}/DRAINING "
+        f"{REMOTE_DIR}/PGID {REMOTE_DIR}/HEARTBEAT {REMOTE_DIR}/RESTARTS",
         timeout=30,
     )
 
@@ -277,7 +281,7 @@ def _reset_node(inst, log):
 def rerun(label, src=".", setup=None, paths=None, cmd=None, grace=None,
           max_age=None, drain=None):
     def log(m):
-        print(f"[rerun:{label}] {m}")
+        logger.info("[rerun:%s] %s", label, m)
 
     existing = _find_existing(label)
     if not existing:
@@ -321,9 +325,11 @@ PROBE = (
     f"HB=$(stat -c %Y {REMOTE_DIR}/HEARTBEAT 2>/dev/null || echo -); "
     f'A=$([ "$HB" != "-" ] && echo $(($(date +%s) - HB)) || echo -); '
     f"C=$(cat {REMOTE_DIR}/RESTARTS 2>/dev/null || echo 0); "
+    f"U=$(timeout 10 nvidia-smi --query-gpu=utilization.gpu "
+    f"--format=csv,noheader,nounits 2>/dev/null | tr '\\n' ',' | sed 's/,$//'); "
     f"printf 'job=%s\\ndone=%s\\nmtime=%s\\nhold=%s\\n"
-    f"drain=%s\\nhas_pgid=%s\\nhb_age=%s\\nrestarts=%s\\n' "
-    f'"$J" "$D" "$M" "$H" "$R" "$G" "$A" "$C"'
+    f"drain=%s\\nhas_pgid=%s\\nhb_age=%s\\nrestarts=%s\\ngpu=%s\\n' "
+    f'"$J" "$D" "$M" "$H" "$R" "$G" "$A" "$C" "$U"'
 )
 
 
@@ -344,6 +350,7 @@ def _probe(inst):
             "has_pgid": f["has_pgid"] == "1",
             "alive": hb != "-" and int(hb) < HEARTBEAT_STALE_S,
             "restarts": int(f["restarts"] or 0),
+            "gpu": f.get("gpu") or "-",
         }
     except Exception:
         return None
@@ -354,6 +361,7 @@ def _signal_shutdown(inst, deadline):
         inst,
         f"{_killgroup('TERM')}; "
         f"touch {REMOTE_DIR}/SHUTDOWN; echo {deadline} > {REMOTE_DIR}/DRAINING",
+        timeout=30,
     )
 
 
@@ -366,14 +374,40 @@ def _find_existing(label):
     return [i for i in get_running_instances() if (i.get("label") or "") == want]
 
 
-def exec_on(label, cmd=None):
+def _one(label):
     matches = _find_existing(label)
     if not matches:
         raise RuntimeError(f"no running node labelled {label!r}")
     if len(matches) > 1:
         ids = ", ".join(str(i["id"]) for i in matches)
         raise RuntimeError(f"multiple nodes labelled {label!r}: {ids}")
-    inst = matches[0]
+    return matches[0]
+
+
+def destroy(label):
+    inst = _one(label)
+    destroy_with_retries(inst["id"])
+    return inst["id"]
+
+
+def set_max_age(label, max_age):
+    inst = _one(label)
+    p = _probe(inst)
+    if not p or not p["job"]:
+        raise RuntimeError("node has no JOB marker")
+    job = p["job"]
+    job["max_age_s"] = max_age
+    _write_job(inst, job)
+    return {
+        "id": inst["id"],
+        "label": label,
+        "max_age_s": max_age,
+        "left_s": _left_s(p, int(time.time())),
+    }
+
+
+def exec_on(label, cmd=None):
+    inst = _one(label)
     if cmd:
         return remote.shell(inst, f"cd {REMOTE_DIR} && {cmd}")
     return remote.shell(inst, f"cd {REMOTE_DIR}; exec bash -l", tty=True)
@@ -417,17 +451,26 @@ def _decide_running(p, now, max_restarts):
     return None, None
 
 
+def _inst_age(inst, now):
+    sd = inst.get("start_date")
+    return now - int(sd) if sd else None
+
+
 def _decide(inst, p, now, default_max_age, max_restarts):
     state = _state(p)
     if state == "unreachable":
-        age = now - int(inst["start_date"]) if inst.get("start_date") else 0
+        age = _inst_age(inst, now)
+        if age is None:
+            return "warn", "unreachable with no start_date; cannot age out, destroy by hand"
         return (
             ("destroy", "unreachable > max_age")
             if age > default_max_age
             else (None, "unreachable, skipping")
         )
     if state == "half-launched":
-        age = now - int(inst["start_date"]) if inst.get("start_date") else 0
+        age = _inst_age(inst, now)
+        if age is None:
+            return "warn", "half-launched with no start_date; cannot age out, destroy by hand"
         if age > LAUNCH_GRACE_S:
             return "destroy", "half-launched (no JOB) past grace"
         return None, "half-launched, within launch grace"
@@ -464,96 +507,92 @@ def _reap_one(inst, now, default_max_age, max_restarts):
     p = _probe(inst)
     label = p["job"]["label"] if p and p["job"] else inst.get("label")
     action, msg = _decide(inst, p, now, default_max_age, max_restarts)
-    if msg:
-        print(f"[reap] {label} {msg}{', destroying' if action == 'destroy' else ''}")
+    if action == "warn":
+        logger.warning("[reap] %s %s", label, msg)
+    elif msg:
+        logger.info(
+            "[reap] %s %s%s", label, msg, ", destroying" if action == "destroy" else ""
+        )
     if action == "destroy":
         destroy_with_retries(inst["id"])
     elif action == "signal":
         _signal_shutdown(inst, now + p["job"]["drain_s"])
     elif action == "restart":
         _restart_job(inst, p["job"]["cmd"])
+    return {"id": inst["id"], "label": label, "action": action, "msg": msg}
 
 
 def reap(default_max_age=86400, max_restarts=3):
     now = int(time.time())
+    results = []
     managed = failed = 0
     for inst in get_running_instances():
         if not _ours(inst):
             continue
         managed += 1
         try:
-            _reap_one(inst, now, default_max_age, max_restarts)
+            results.append(_reap_one(inst, now, default_max_age, max_restarts))
         except Exception as e:
             failed += 1
-            print(f"[reap] {inst['id']} error, skipping this tick: {e!r}")
+            logger.warning("[reap] %s error, skipping this tick: %r", inst["id"], e)
     if managed and failed == managed:
         raise RuntimeError(
             f"reap failed on all {managed} managed node(s); environment likely "
             f"broken (is ssh/tar on the service PATH?)"
         )
+    return results
 
 
 def list_gpus(max_price=1000.0, min_gpu=1):
     cheapest = {}
-    filter = AvailableInstancesFilter(min_gpu=min_gpu, max_dollar_price_hour=max_price)
-    for o in get_available_instances(filter):
+    filters = AvailableInstancesFilter(min_gpu=min_gpu, max_dollar_price_hour=max_price)
+    for o in get_available_instances(filters):
         name = o["gpu"]
         if name not in cheapest or o["price"] < cheapest[name]:
             cheapest[name] = o["price"]
-    for name, price in sorted(cheapest.items()):
-        print(f"{name:20} from ${price:.3f}/h")
+    return sorted(cheapest.items())
 
 
-def clean(force=False):
-    targets = [i for i in get_running_instances() if _ours(i)]
-    if not targets:
-        print("[clean] no managed instances")
-        return
-    for inst in targets:
-        label = (inst.get("label") or "")[len(LABEL_PREFIX) :]
-        print(f"[clean] {inst['id']}  {label}")
-    if not force and not _confirm(f"destroy these {len(targets)} instance(s)? [y/N] "):
-        print("[clean] aborted")
-        return
-    for inst in targets:
-        destroy_with_retries(inst["id"])
+def list_managed():
+    return [i for i in get_running_instances() if _ours(i)]
 
 
-def _fmt_dur(s):
-    if s <= 0:
-        return "expired"
-    h, rem = divmod(s, 3600)
-    m, _ = divmod(rem, 60)
-    if h:
-        return f"{h}h{m:02d}m"
-    return f"{m}m" if m else f"{s}s"
+def clean(targets=None):
+    if targets is None:
+        targets = list_managed()
+    return [i["id"] for i in targets if destroy_with_retries(i["id"])]
 
 
-def _lifetime(p, now):
-    if not p or not p["job"]:
-        return "-"
-    j = p["job"]
-    return _fmt_dur(j["max_age_s"] - (now - j["launched_at"]))
-
-
-def _age(inst, p, now):
+def _age_s(inst, p, now):
     if p and p["job"]:
-        return _fmt_dur(now - p["job"]["launched_at"])
+        return now - p["job"]["launched_at"]
     if inst.get("start_date"):
-        return _fmt_dur(now - int(inst["start_date"]))
-    return "-"
+        return now - int(inst["start_date"])
+    return None
+
+
+def _left_s(p, now):
+    if not p or not p["job"]:
+        return None
+    j = p["job"]
+    return j["max_age_s"] - (now - j["launched_at"])
 
 
 def ps():
     now = int(time.time())
+    rows = []
     for inst, p in _managed():
-        state = _state(p)
-        if state == "exited":
-            state += f"({p['done']})" + (" HOLD" if p["hold"] else "")
-        label = (inst.get("label") or "")[len(LABEL_PREFIX) :]
-        age, left = _age(inst, p, now), _lifetime(p, now)
-        restarts = f" restarts {p['restarts']}" if p and p.get("restarts") else ""
-        print(
-            f"{inst['id']:>10}  {label:<20} {state:<18} "
-            f"up {age:<7} left {left}{restarts}"
+        rows.append(
+            {
+                "id": inst["id"],
+                "label": (inst.get("label") or "")[len(LABEL_PREFIX) :],
+                "state": _state(p),
+                "done": p["done"] if p else "-",
+                "hold": bool(p and p.get("hold")),
+                "age_s": _age_s(inst, p, now),
+                "left_s": _left_s(p, now),
+                "gpu": p["gpu"] if p and p.get("gpu") else "-",
+                "restarts": p["restarts"] if p and p.get("restarts") else 0,
+            }
         )
+    return rows

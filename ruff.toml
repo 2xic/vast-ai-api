@@ -3,3 +3,8 @@ line-length = 88
 [lint]
 select = ["E", "F", "W", "B", "SIM", "UP", "RUF", "I", "PL"]
 ignore = ["PLR0911", "PLR0913", "PLR0915"]
+
+[lint.per-file-ignores]
+"bash_test.py" = ["E402"]
+"decide_test.py" = ["E402"]
+"client_test.py" = ["E402"]

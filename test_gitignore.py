@@ -5,7 +5,7 @@ import os
 import subprocess
 import tempfile
 
-from vast_cli.remote import git_files
+from vast_cli.api.remote import git_files
 
 
 def _write(root, path, content=""):
