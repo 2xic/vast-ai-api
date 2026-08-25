@@ -40,8 +40,25 @@ def git_files(local_dir):
     return [f for f in out.decode().split("\0") if f]
 
 
+def addr(inst, direct=False):
+    d = inst.get("ssh_direct") if direct else None
+    if d:
+        return d["host"], d["port"]
+    return inst.get("ssh_host"), inst.get("ssh_port")
+
+
 def base(inst):
     return ["ssh", *SSH_OPTS, "-p", str(inst["ssh_port"]), f"root@{inst['ssh_host']}"]
+
+
+def ssh_argv(inst, forwards=(), direct=False):
+    host, port = addr(inst, direct)
+    if not host or not port:
+        raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
+    argv = ["ssh", *SSH_OPTS, "-p", str(port)]
+    for f in forwards:
+        argv += ["-L", f]
+    return [*argv, f"root@{host}"]
 
 
 def shell(inst, cmd, tty=False):

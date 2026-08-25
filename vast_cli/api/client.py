@@ -169,16 +169,35 @@ def _fmt_ports(public_ip, ports):
     return out
 
 
+def _direct_ssh(public_ip, ports):
+    if not public_ip:
+        return None
+    try:
+        return {"host": public_ip, "port": int(ports["22/tcp"][0]["HostPort"])}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _proxy_port(instance):
+    try:
+        port = int(instance["ssh_port"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return port + 1 if "jupyter" in (instance.get("image_runtype") or "") else port
+
+
 def _instance_row(instance):
     host = instance.get("ssh_host")
-    port = instance.get("ssh_port")
+    port = _proxy_port(instance)
     public_ip = instance.get("public_ipaddr")
+    ports = instance.get("ports") or {}
     return {
         "id": instance["id"],
         "ssh_host": host,
         "ssh_port": port,
+        "ssh_direct": _direct_ssh(public_ip, ports),
         "ssh": f"ssh root@{host} -p {port}",
-        "open_ports": _fmt_ports(public_ip, instance.get("ports") or {}),
+        "open_ports": _fmt_ports(public_ip, ports),
         "public_ip": public_ip,
         "status": instance.get("actual_status"),
         "label": instance.get("label"),

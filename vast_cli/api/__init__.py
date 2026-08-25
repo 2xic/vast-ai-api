@@ -11,6 +11,7 @@ from vast_cli.api.run import (
     reap,
     rerun,
     set_max_age,
+    ssh_argv,
 )
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "exec_on",
     "destroy",
     "set_max_age",
+    "ssh_argv",
     "list_gpus",
     "list_managed",
     "clean",

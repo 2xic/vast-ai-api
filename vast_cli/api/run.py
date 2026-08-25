@@ -406,6 +406,54 @@ def set_max_age(label, max_age):
     }
 
 
+def _summary(instances):
+    return ", ".join(
+        f"{i.get('label') or '(unlabelled)'} (id {i['id']}, {i.get('status')})"
+        for i in instances
+    )
+
+
+def resolve(target=None):
+    instances = list(get_running_instances())
+    live = [i for i in instances if i.get("status") == "running"]
+    if target is None:
+        if len(live) == 1:
+            return live[0]
+        if not live:
+            raise RuntimeError(f"no running instance: {_summary(instances) or 'none'}")
+        raise RuntimeError(f"pick an instance: {_summary(live)}")
+    wanted = (target, LABEL_PREFIX + target)
+    hits = [i for i in instances if (i.get("label") or "") in wanted]
+    if not hits:
+        raise RuntimeError(
+            f"no instance labelled {target!r}: {_summary(instances) or 'none'}"
+        )
+    running = [i for i in hits if i.get("status") == "running"]
+    if not running:
+        raise RuntimeError(f"{target!r} is not running: {_summary(hits)}")
+    if len(running) > 1:
+        raise RuntimeError(
+            f"multiple instances labelled {target!r}: {_summary(running)}"
+        )
+    return running[0]
+
+
+def _forward(spec):
+    local, sep, remote_port = spec.partition(":")
+    if ":" in remote_port:
+        return spec
+    if not sep:
+        remote_port = local
+    if not (local.isdigit() and remote_port.isdigit()):
+        raise RuntimeError(f"bad port forward {spec!r}")
+    return f"{local}:localhost:{remote_port}"
+
+
+def ssh_argv(target=None, forwards=(), direct=True):
+    inst = resolve(target)
+    return remote.ssh_argv(inst, [_forward(f) for f in forwards], direct)
+
+
 def exec_on(label, cmd=None):
     inst = _one(label)
     if cmd:

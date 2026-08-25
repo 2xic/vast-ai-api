@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import shlex
 import sys
 
 from vast_cli.api import AvailableInstancesFilter, InstanceOptions, run
@@ -125,6 +126,28 @@ def main():
         "cmd", nargs=argparse.REMAINDER, help="command (default: interactive)"
     )
 
+    sh = sub.add_parser("ssh", help="ssh into a running instance, with port forwards")
+    sh.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="node label (default: the only running instance)",
+    )
+    sh.add_argument(
+        "-L",
+        "--forward",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="port forward: 8081, 8081:9090, or LOCAL:HOST:REMOTE (repeatable)",
+    )
+    sh.add_argument(
+        "--proxy", action="store_true", help="use the vast ssh proxy, not the direct ip"
+    )
+    sh.add_argument(
+        "--print", dest="print_only", action="store_true", help="print the command only"
+    )
+
     r = sub.add_parser(
         "reap", help="cron on your always-on host: reconcile jobs, warn-then-destroy"
     )
@@ -224,6 +247,12 @@ def _dispatch(args):
         )
     elif args.command == "exec":
         sys.exit(run.exec_on(args.label, cmd=" ".join(args.cmd) or None))
+    elif args.command == "ssh":
+        argv = run.ssh_argv(args.target, forwards=args.forward, direct=not args.proxy)
+        if args.print_only:
+            print(shlex.join(argv))
+            return
+        os.execvp(argv[0], argv)
     elif args.command == "reap":
         run.reap(default_max_age=args.max_age, max_restarts=args.max_restarts)
     elif args.command == "ps":
