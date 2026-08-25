@@ -39,6 +39,15 @@ def _print_ps(rows):
         )
 
 
+def _split_ssh(argv):
+    if not argv or argv[0] != "ssh":
+        return argv, []
+    for n, a in enumerate(argv[1:], 1):
+        if not a.startswith("-"):
+            return argv[: n + 1], argv[n + 1 :]
+    return argv, []
+
+
 def main():
     parser = argparse.ArgumentParser(prog="vast")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -126,20 +135,15 @@ def main():
         "cmd", nargs=argparse.REMAINDER, help="command (default: interactive)"
     )
 
-    sh = sub.add_parser("ssh", help="ssh into a running instance, with port forwards")
+    sh = sub.add_parser(
+        "ssh",
+        help="ssh to a running instance; everything after the label goes to ssh",
+    )
     sh.add_argument(
         "target",
         nargs="?",
         default=None,
         help="node label (default: the only running instance)",
-    )
-    sh.add_argument(
-        "-L",
-        "--forward",
-        action="append",
-        default=[],
-        metavar="SPEC",
-        help="port forward: 8081, 8081:9090, or LOCAL:HOST:REMOTE (repeatable)",
     )
     sh.add_argument(
         "--proxy", action="store_true", help="use the vast ssh proxy, not the direct ip"
@@ -187,7 +191,9 @@ def main():
     gpus_p.add_argument("--price", type=float, default=1000.0, help="max $/hour")
     gpus_p.add_argument("--gpus", type=int, default=1, help="min gpu count")
 
-    args = parser.parse_args()
+    argv, ssh_args = _split_ssh(sys.argv[1:])
+    args = parser.parse_args(argv)
+    args.ssh_args = ssh_args
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     try:
@@ -248,7 +254,7 @@ def _dispatch(args):
     elif args.command == "exec":
         sys.exit(run.exec_on(args.label, cmd=" ".join(args.cmd) or None))
     elif args.command == "ssh":
-        argv = run.ssh_argv(args.target, forwards=args.forward, direct=not args.proxy)
+        argv = run.ssh_argv(args.target, args.ssh_args, direct=not args.proxy)
         if args.print_only:
             print(shlex.join(argv))
             return

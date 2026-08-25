@@ -51,14 +51,11 @@ def base(inst):
     return ["ssh", *SSH_OPTS, "-p", str(inst["ssh_port"]), f"root@{inst['ssh_host']}"]
 
 
-def ssh_argv(inst, forwards=(), direct=False):
+def ssh_argv(inst, ssh_args=(), direct=False):
     host, port = addr(inst, direct)
     if not host or not port:
         raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
-    argv = ["ssh", *SSH_OPTS, "-p", str(port)]
-    for f in forwards:
-        argv += ["-L", f]
-    return [*argv, f"root@{host}"]
+    return ["ssh", *SSH_OPTS, "-p", str(port), f"root@{host}", *ssh_args]
 
 
 def shell(inst, cmd, tty=False):

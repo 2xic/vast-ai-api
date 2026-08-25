@@ -438,20 +438,8 @@ def resolve(target=None):
     return running[0]
 
 
-def _forward(spec):
-    local, sep, remote_port = spec.partition(":")
-    if ":" in remote_port:
-        return spec
-    if not sep:
-        remote_port = local
-    if not (local.isdigit() and remote_port.isdigit()):
-        raise RuntimeError(f"bad port forward {spec!r}")
-    return f"{local}:localhost:{remote_port}"
-
-
-def ssh_argv(target=None, forwards=(), direct=True):
-    inst = resolve(target)
-    return remote.ssh_argv(inst, [_forward(f) for f in forwards], direct)
+def ssh_argv(target=None, ssh_args=(), direct=True):
+    return remote.ssh_argv(resolve(target), ssh_args, direct)
 
 
 def exec_on(label, cmd=None):

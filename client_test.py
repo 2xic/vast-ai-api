@@ -27,7 +27,7 @@ _stub("urllib3.util", Retry=lambda *a, **k: None)
 _stub("dotenv", load_dotenv=lambda *a, **k: None)
 
 import vast_cli.__main__ as main_mod
-from vast_cli.api import client, run
+from vast_cli.api import client, remote, run
 
 CASES = []
 
@@ -78,43 +78,30 @@ def missing_instances_key_still_raises():
     raise AssertionError("total API failure should still raise")
 
 
-@case
-def ssh_prefers_direct_and_expands_forwards():
-    rows = [
-        {
-            "id": 7,
-            "ssh_host": "proxy",
-            "ssh_port": 100,
-            "ssh_direct": {"host": "1.2.3.4", "port": 40125},
-            "status": "running",
-            "label": "vrun:web",
-        }
-    ]
-    run.get_running_instances = lambda: iter(rows)
-    argv = run.ssh_argv("web", forwards=["8081", "9000:80"])
-    assert "root@1.2.3.4" in argv, f"direct address not used: {argv}"
-    assert argv[argv.index("-p") + 1] == "40125", f"direct port not used: {argv}"
-    fwd = [argv[n + 1] for n, a in enumerate(argv) if a == "-L"]
-    assert fwd == ["8081:localhost:8081", "9000:localhost:80"], f"bad forwards: {fwd}"
-    proxied = run.ssh_argv("web", direct=False)
-    assert "root@proxy" in proxied, f"--proxy ignored: {proxied}"
+NODE = {
+    "id": 7,
+    "ssh_host": "proxy",
+    "ssh_port": 100,
+    "ssh_direct": {"host": "1.2.3.4", "port": 40125},
+    "status": "running",
+    "label": "vrun:web",
+}
+
+
+def _only_node(**over):
+    run.get_running_instances = lambda: iter([{**NODE, **over}])
 
 
 @case
-def ssh_falls_back_to_proxy_and_refuses_addressless_nodes():
-    proxy_only = {
-        "id": 8,
-        "ssh_host": "proxy",
-        "ssh_port": 100,
-        "ssh_direct": None,
-        "status": "running",
-        "label": "vrun:web",
-    }
-    run.get_running_instances = lambda: iter([proxy_only])
+def ssh_prefers_direct_and_falls_back_to_the_proxy():
+    _only_node()
     argv = run.ssh_argv("web")
-    assert "root@proxy" in argv, f"no direct address should fall back: {argv}"
-    pending = {**proxy_only, "ssh_host": None, "ssh_port": None}
-    run.get_running_instances = lambda: iter([pending])
+    assert argv[-1] == "root@1.2.3.4", f"direct address not used: {argv}"
+    assert argv[argv.index("-p") + 1] == "40125", f"direct port not used: {argv}"
+    assert run.ssh_argv("web", direct=False)[-1] == "root@proxy", "--proxy ignored"
+    _only_node(ssh_direct=None)
+    assert run.ssh_argv("web")[-1] == "root@proxy", "no direct address should fall back"
+    _only_node(ssh_direct=None, ssh_host=None, ssh_port=None)
     try:
         run.ssh_argv("web")
     except RuntimeError:
@@ -123,14 +110,66 @@ def ssh_falls_back_to_proxy_and_refuses_addressless_nodes():
 
 
 @case
-def ssh_rejects_bad_forward_specs():
-    for spec in ("8081:", "", "http", "80:eighty", ":80"):
-        try:
-            run._forward(spec)
-        except RuntimeError:
-            continue
-        raise AssertionError(f"{spec!r} should be rejected")
-    assert run._forward("1259:localhost:22") == "1259:localhost:22", "3-part spec"
+def everything_after_the_label_goes_to_ssh_verbatim():
+    _only_node()
+    execed = []
+    main_mod.os.execvp = lambda f, a: execed.append(a)
+    extra = ["-N", "-L", "8081:localhost:8081", "-o", "ExitOnForwardFailure=yes"]
+    sys.argv = ["vast", "ssh", "web", *extra]
+    main_mod.main()
+    assert execed[0][-len(extra) :] == extra, f"passthrough mangled: {execed[0]}"
+    assert execed[0][-len(extra) - 1] == "root@1.2.3.4", "host must come first"
+
+    sys.argv = ["vast", "ssh", "web", "uv", "run", "serve.py"]
+    main_mod.main()
+    assert execed[1][-3:] == ["uv", "run", "serve.py"], f"command lost: {execed[1]}"
+
+    sys.argv = ["vast", "ssh", "--proxy", "web", "-v"]
+    main_mod.main()
+    assert execed[2][-2:] == ["root@proxy", "-v"], (
+        f"our flags not honoured: {execed[2]}"
+    )
+
+    sys.argv = ["vast", "ssh", "web", "--print"]
+    main_mod.main()
+    assert execed[3][-1] == "--print", "after the label, even our flags go to ssh"
+
+
+@case
+def the_label_is_the_first_non_flag_word():
+    split = main_mod._split_ssh
+    assert split(["ssh", "web", "-N"]) == (["ssh", "web"], ["-N"]), (
+        "label then ssh args"
+    )
+    assert split(["ssh", "--print", "web"]) == (["ssh", "--print", "web"], []), "ours"
+    assert split(["ssh", "-h"]) == (["ssh", "-h"], []), "no label means nothing to ssh"
+    assert split(["ssh"]) == (["ssh"], []), "a bare ssh keeps the default target"
+    assert split(["ps"]) == (["ps"], []), "other subcommands are untouched"
+    assert split(["exec", "web", "-la"]) == (["exec", "web", "-la"], []), "exec intact"
+
+
+@case
+def print_before_the_label_shows_the_command_without_connecting():
+    _only_node()
+    execed = []
+    main_mod.os.execvp = lambda f, a: execed.append(a)
+    sys.argv = ["vast", "ssh", "--print", "web", "-L", "8081:localhost:8081"]
+    main_mod.main()
+    assert not execed, "--print must not connect"
+
+
+@case
+def real_ssh_accepts_what_we_build():
+    if shutil.which("ssh") is None:
+        raise AssertionError("no ssh binary to validate against")
+    inst = {"id": 7, "ssh_host": "h", "ssh_port": 100, "ssh_direct": None}
+    argv = remote.ssh_argv(
+        inst, ["-L", "8081:localhost:8081", "-p", "2222", "uv", "run", "serve.py"]
+    )
+    done = subprocess.run([argv[0], "-G", *argv[1:]], capture_output=True, check=False)
+    assert done.returncode == 0, f"ssh rejected our argv: {done.stderr}"
+    out = done.stdout.decode()
+    assert "\nport 100\n" in out, f"our resolved port must win over a later -p: {out}"
 
 
 @case
@@ -188,53 +227,6 @@ def jupyter_nodes_get_the_offset_proxy_port():
     assert ports[1] == 101, f"jupyter runtype needs ssh_port+1, got {ports[1]}"
     assert ports[2] == 100, f"plain ssh runtype must not shift, got {ports[2]}"
     assert ports[3] is None, f"a node with no port must stay None, got {ports[3]}"
-
-
-@case
-def real_ssh_accepts_the_command_we_build():
-    if shutil.which("ssh") is None:
-        raise AssertionError("no ssh binary to validate against")
-    rows = [
-        {
-            "id": 7,
-            "ssh_host": "proxy",
-            "ssh_port": 100,
-            "ssh_direct": {"host": "1.2.3.4", "port": 40125},
-            "status": "running",
-            "label": "vrun:web",
-        }
-    ]
-    run.get_running_instances = lambda: iter(rows)
-    argv = run.ssh_argv("web", forwards=["8081", "9000:80", "1259:localhost:1259"])
-    probe = [argv[0], "-G", *argv[1:]]
-    done = subprocess.run(probe, capture_output=True, check=False)
-    assert done.returncode == 0, f"ssh rejected our argv: {done.stderr}"
-
-
-@case
-def cli_execs_ssh_and_print_does_not():
-    rows = [
-        {
-            "id": 7,
-            "ssh_host": "proxy",
-            "ssh_port": 100,
-            "ssh_direct": {"host": "1.2.3.4", "port": 40125},
-            "status": "running",
-            "label": "vrun:web",
-        }
-    ]
-    run.get_running_instances = lambda: iter(rows)
-    execed = []
-    main_mod.os.execvp = lambda f, a: execed.append((f, a))
-    sys.argv = ["vast", "ssh", "web", "-L", "8081", "--print"]
-    main_mod.main()
-    assert not execed, "--print must not connect"
-    sys.argv = ["vast", "ssh", "web", "-L", "8081"]
-    main_mod.main()
-    assert len(execed) == 1, "ssh should exec exactly once"
-    prog, argv = execed[0]
-    assert prog == "ssh" and argv[0] == "ssh", f"bad exec target: {execed[0]}"
-    assert "8081:localhost:8081" in argv, f"forward lost on the cli path: {argv}"
 
 
 @case
