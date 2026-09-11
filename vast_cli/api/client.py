@@ -148,14 +148,14 @@ class InstanceError(RuntimeError):
 def _failure(inst):
     if not inst:
         return None
-    if inst["status"] == "exited":
+    if inst["status"] in ("exited", "offline"):
         return inst["status"]
     msg = inst.get("status_msg") or ""
     return msg if "error" in msg.lower() else None
 
 
 def wait_until_ready(
-    instance_id, timeout=1800, poll=10, log=None, error_grace=6, stall_s=60
+    instance_id, timeout=1800, poll=10, log=None, error_grace=6, stall_s=1200
 ):
     deadline = time.time() + timeout
     errors = 0
@@ -190,7 +190,7 @@ def wait_until_ready(
                     f"{mark[0][1]!r}"
                 )
             if log:
-                log(f"status={inst['status']}, not ready yet")
+                log(f"status={inst['status']} msg={inst['status_msg']!r}")
         time.sleep(poll)
     raise TimeoutError(f"instance {instance_id} not ready within {timeout}s")
 
