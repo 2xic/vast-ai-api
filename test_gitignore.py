@@ -3,9 +3,21 @@
 # ///
 import os
 import subprocess
+import sys
 import tempfile
 
-from vast_cli.api.remote import git_files
+_HOME = tempfile.mkdtemp()
+for _leak in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+    os.environ.pop(_leak, None)
+os.environ.update(
+    HOME=_HOME,
+    XDG_CONFIG_HOME=_HOME,
+    GIT_CONFIG_GLOBAL=os.devnull,
+    GIT_CONFIG_SYSTEM=os.devnull,
+    GIT_CEILING_DIRECTORIES=tempfile.gettempdir(),
+)
+
+from vast_cli.api.remote import git_files  # noqa: E402
 
 
 def _write(root, path, content=""):
@@ -34,6 +46,32 @@ def test_not_a_repo_returns_none():
     assert git_files(root) is None
 
 
+def test_file_selection_needs_no_http_stack():
+    assert "requests" not in sys.modules, "picking files must not need the api client"
+
+
+def test_empty_repo_pushes_nothing_rather_than_everything():
+    root = tempfile.mkdtemp()
+    subprocess.run(["git", "-C", root, "init", "-q"], check=True)
+    assert git_files(root) == [], "an empty repo must not look like a missing repo"
+
+
+def test_paths_with_spaces_survive():
+    root = tempfile.mkdtemp()
+    subprocess.run(["git", "-C", root, "init", "-q"], check=True)
+    _write(root, "my notes/a b.txt", "x")
+    assert git_files(root) == ["my notes/a b.txt"], "a space must not split a path"
+
+
+def test_nested_gitignore_is_respected():
+    root = _repo()
+    _write(root, "pkg/.gitignore", "*.log\n")
+    _write(root, "pkg/debug.log", "noise")
+    files = set(git_files(root))
+    assert "pkg/debug.log" not in files, "nested ignore rule LEAKED"
+    assert "pkg/.gitignore" in files, "the nested ignore file itself must ship"
+
+
 def test_gitignore_respected():
     files = set(git_files(_repo()))
     assert "train.py" in files, "tracked file missing"
@@ -47,7 +85,13 @@ def test_gitignore_respected():
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
     for fn in fns:
-        fn()
-        print(f"PASS {fn.__name__}")
-    print(f"\n{len(fns)} passed")
+        try:
+            fn()
+            print(f"PASS {fn.__name__}")
+        except Exception as e:
+            failed += 1
+            print(f"FAIL {fn.__name__}: {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)

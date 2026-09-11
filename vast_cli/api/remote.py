@@ -1,7 +1,12 @@
+import hashlib
+import logging
 import os
 import shlex
 import subprocess
+import tempfile
 import time
+
+logger = logging.getLogger("vast_cli")
 
 SSH_OPTS = [
     "-o",
@@ -47,15 +52,55 @@ def addr(inst, direct=False):
     return inst.get("ssh_host"), inst.get("ssh_port")
 
 
+def _addr_candidates(inst):
+    out = []
+    for direct in (True, False):
+        cand = addr(inst, direct)
+        if cand[0] and cand[1] and cand not in out:
+            out.append(cand)
+    return out
+
+
+def _mux_dir():
+    path = os.path.join(tempfile.gettempdir(), f"vast-ssh-{os.getuid()}")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def _mux_opts(inst, host, port):
+    key = hashlib.sha256(f"{inst['id']}@{host}:{port}".encode()).hexdigest()[:8]
+    sock = os.path.join(_mux_dir(), f"{inst['id']}-{key}")
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={sock}",
+        "-o",
+        "ControlPersist=120",
+    ]
+
+
+def _argv(inst, host, port, ssh_args=()):
+    if not host or not port:
+        raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
+    return [
+        "ssh",
+        *SSH_OPTS,
+        *_mux_opts(inst, host, port),
+        "-p",
+        str(port),
+        f"root@{host}",
+        *ssh_args,
+    ]
+
+
 def base(inst):
-    return ["ssh", *SSH_OPTS, "-p", str(inst["ssh_port"]), f"root@{inst['ssh_host']}"]
+    host, port = inst.get("ssh_addr") or addr(inst)
+    return _argv(inst, host, port)
 
 
 def ssh_argv(inst, ssh_args=(), direct=False):
-    host, port = addr(inst, direct)
-    if not host or not port:
-        raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
-    return ["ssh", *SSH_OPTS, "-p", str(port), f"root@{host}", *ssh_args]
+    return _argv(inst, *addr(inst, direct), ssh_args)
 
 
 def shell(inst, cmd, tty=False):
@@ -78,24 +123,43 @@ def run(inst, cmd, timeout=None):
     return p.returncode, p.stdout, p.stderr
 
 
-def wait(inst, timeout=180, poll=5, log=None):
+def _probe(inst, host, port, timeout=30):
+    try:
+        p = subprocess.run(
+            [*_argv(inst, host, port), "true"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    err = p.stderr.strip()
+    return p.returncode, err.splitlines()[-1] if err else "no stderr"
+
+
+def wait(inst, timeout=600, poll=5, log=None):
+    candidates = _addr_candidates(inst)
+    if not candidates:
+        raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
     end = time.time() + timeout
     while True:
-        rc, _, err = run(inst, "true", timeout=30)
-        if rc == 0:
-            return
-        err = err.strip().splitlines()[-1] if err.strip() else "no stderr"
+        tried = []
+        for host, port in candidates:
+            rc, err = _probe(inst, host, port)
+            if rc == 0:
+                inst["ssh_addr"] = (host, port)
+                return
+            tried.append(f"{host}:{port} rc={rc} ({err})")
+        report = "; ".join(tried)
         if time.time() > end:
-            raise RuntimeError(
-                f"ssh not ready on {inst['ssh_host']}:{inst['ssh_port']} "
-                f"within {timeout}s (rc={rc}): {err}"
-            )
+            raise RuntimeError(f"ssh not ready within {timeout}s: {report}")
         if log:
-            log(f"ssh not up (rc={rc}): {err}")
+            log(f"ssh not up: {report}")
         time.sleep(poll)
 
 
-def _stream(inst, tar_src, dest):
+def _stream_once(inst, tar_src, dest):
     unpack = f"mkdir -p {shlex.quote(dest)} && tar xzf - -C {shlex.quote(dest)}"
     tar = subprocess.Popen(["tar", "czf", "-", *tar_src], stdout=subprocess.PIPE)
     try:
@@ -104,8 +168,30 @@ def _stream(inst, tar_src, dest):
         tar.stdout.close()
     rc = ssh.wait()
     tar.wait()
-    if rc or tar.returncode:
-        raise RuntimeError(f"upload failed (tar={tar.returncode} ssh={rc})")
+    return tar.returncode, rc
+
+
+def _stream(inst, tar_src, dest, attempts=5, backoff=5):
+    for attempt in range(1, attempts + 1):
+        tar_rc, rc = _stream_once(inst, tar_src, dest)
+        if not (tar_rc or rc):
+            return
+        if rc == 0:
+            raise RuntimeError(f"upload failed locally (tar={tar_rc})")
+        if attempt == attempts:
+            raise RuntimeError(
+                f"upload failed after {attempts} attempts (tar={tar_rc} ssh={rc})"
+            )
+        delay = backoff * 2 ** (attempt - 1)
+        logger.warning(
+            "[push] attempt %s/%s failed (tar=%s ssh=%s); retrying in %ss",
+            attempt,
+            attempts,
+            tar_rc,
+            rc,
+            delay,
+        )
+        time.sleep(delay)
 
 
 def put(inst, local, dest, files=None):

@@ -30,6 +30,7 @@ _stub("urllib3.util", Retry=lambda *a, **k: None)
 _stub("dotenv", load_dotenv=lambda *a, **k: None)
 
 import vast_cli.__main__ as main_mod
+from vast_cli import api
 from vast_cli.api import client, remote, run
 
 CASES = []
@@ -45,6 +46,16 @@ def _fake_clock():
         yield now
     finally:
         client.time.sleep, client.time.time = real_sleep, real_time
+
+
+@contextlib.contextmanager
+def _instant_retries():
+    real = remote.time.sleep
+    remote.time.sleep = lambda s: None
+    try:
+        yield
+    finally:
+        remote.time.sleep = real
 
 
 @contextlib.contextmanager
@@ -213,7 +224,8 @@ def a_receiver_that_dies_mid_push_does_not_hang():
     signal.signal(signal.SIGALRM, hung)
     signal.alarm(20)
     try:
-        remote._stream({"id": 7}, ["-C", d, "."], "/root/proj")
+        with _instant_retries():
+            remote._stream({"id": 7}, ["-C", d, "."], "/root/proj")
     except RuntimeError:
         return
     finally:
@@ -414,6 +426,176 @@ def an_instance_that_vanishes_does_not_hang_until_timeout():
         except TimeoutError as e:
             raise AssertionError("a vanished node must not wait out 1800s") from e
     raise AssertionError("a vanished node must raise")
+
+
+@case
+def a_dropped_push_is_retried_not_fatal():
+    calls = []
+
+    def flaky(inst, tar_src, dest):
+        calls.append(dest)
+        return (0, 0) if len(calls) > 1 else (2, 255)
+
+    with _patched(remote, _stream_once=flaky), _instant_retries():
+        remote._stream({"id": 7}, ["-C", "/tmp", "."], "/root/proj")
+    assert len(calls) == 2, f"one drop must be retried, not fatal: {calls}"
+
+
+@case
+def a_push_that_never_lands_still_fails():
+    calls = []
+
+    def always_drops(inst, tar_src, dest):
+        calls.append(dest)
+        return (2, 255)
+
+    with _patched(remote, _stream_once=always_drops), _instant_retries():
+        try:
+            remote._stream({"id": 7}, ["-C", "/tmp", "."], "/root/proj")
+        except RuntimeError as e:
+            assert "ssh=255" in str(e), f"the real rc must survive retries: {e}"
+            assert len(calls) == 5, f"must stop after 5 attempts: {calls}"
+            return
+    raise AssertionError("a push that never lands must raise")
+
+
+@case
+def a_local_tar_failure_is_not_retried():
+    calls = []
+
+    def bad_tar(inst, tar_src, dest):
+        calls.append(dest)
+        return (2, 0)
+
+    with _patched(remote, _stream_once=bad_tar), _instant_retries():
+        try:
+            remote._stream({"id": 7}, ["-C", "/tmp", "."], "/root/proj")
+        except RuntimeError as e:
+            assert "tar=2" in str(e), f"must name the local failure: {e}"
+            assert len(calls) == 1, f"a local failure must not re-upload: {calls}"
+            return
+    raise AssertionError("a local tar failure must raise")
+
+
+@case
+def every_public_name_still_resolves():
+    missing = [n for n in api.__all__ if not hasattr(api, n)]
+    assert not missing, f"lazy export map is out of date: {missing}"
+
+
+@case
+def a_direct_ip_is_used_only_once_it_is_proven():
+    inst = {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+    argv = remote.base(inst)
+    assert "root@ssh8.vast.ai" in argv, (
+        f"an unproven direct ip must not be used: {argv}"
+    )
+    with _patched(remote, _probe=lambda *a, **k: (0, "")):
+        remote.wait(inst, timeout=1, poll=0)
+    argv = remote.base(inst)
+    assert "root@1.2.3.4" in argv, f"a proven direct ip must be used: {argv}"
+    assert "40022" in argv, f"must use the direct port: {argv}"
+
+
+@case
+def commands_fall_back_to_the_proxy_without_a_direct_ip():
+    inst = {"id": 9, "ssh_host": "ssh8.vast.ai", "ssh_port": 11778, "ssh_direct": None}
+    argv = remote.base(inst)
+    assert "root@ssh8.vast.ai" in argv, f"must still reach the node: {argv}"
+    assert "11778" in argv, f"must use the proxy port: {argv}"
+
+
+@case
+def the_proxy_flag_is_not_swallowed_by_an_open_direct_session():
+    inst = {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+
+    def sock(argv):
+        return next(a for a in argv if a.startswith("ControlPath="))
+
+    direct = remote.ssh_argv(inst, direct=True)
+    proxy = remote.ssh_argv(inst, direct=False)
+    assert "root@ssh8.vast.ai" in proxy, f"--proxy must reach the relay: {proxy}"
+    assert sock(direct) != sock(proxy), "--proxy must not ride the direct session"
+
+
+@case
+def repeated_commands_reuse_one_ssh_connection():
+    argv = remote.base({"id": 7, "ssh_host": "h", "ssh_port": 1, "ssh_direct": None})
+    assert "ControlMaster=auto" in argv, f"each push must not re-handshake: {argv}"
+    paths = [a for a in argv if a.startswith("ControlPath=")]
+    assert paths, f"no socket: {argv}"
+
+
+@case
+def two_nodes_never_share_a_control_socket():
+    def sock(inst_id):
+        argv = remote.base(
+            {"id": inst_id, "ssh_host": "h", "ssh_port": 1, "ssh_direct": None}
+        )
+        return next(a for a in argv if a.startswith("ControlPath="))
+
+    assert sock(1) != sock(2), "same address, different node, must not share a socket"
+
+
+@case
+def a_blocked_direct_ip_falls_back_to_the_proxy():
+    inst = {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+    seen = []
+
+    def only_proxy_answers(inst, host, port, timeout=30):
+        seen.append(host)
+        return (0, "") if host == "ssh8.vast.ai" else (255, "refused")
+
+    with _patched(remote, _probe=only_proxy_answers):
+        remote.wait(inst, timeout=1, poll=0)
+    assert inst["ssh_addr"] == ("ssh8.vast.ai", 11778), f"wrong pick: {inst}"
+    assert "root@ssh8.vast.ai" in remote.base(inst), "later commands must follow"
+
+
+@case
+def a_reachable_direct_ip_is_preferred():
+    inst = {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+    with _patched(remote, _probe=lambda *a, **k: (0, "")):
+        remote.wait(inst, timeout=1, poll=0)
+    assert inst["ssh_addr"] == ("1.2.3.4", 40022), f"must not relay: {inst}"
+
+
+@case
+def a_node_that_answers_on_neither_address_still_fails():
+    inst = {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+    with _patched(remote, _probe=lambda *a, **k: (255, "refused")):
+        try:
+            remote.wait(inst, timeout=0, poll=0)
+        except RuntimeError as e:
+            assert "1.2.3.4:40022" in str(e), f"must name both addresses: {e}"
+            assert "ssh8.vast.ai:11778" in str(e), f"must name both addresses: {e}"
+            return
+    raise AssertionError("an unreachable node must raise")
 
 
 @case
