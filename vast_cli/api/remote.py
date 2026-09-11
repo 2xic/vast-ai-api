@@ -98,7 +98,11 @@ def wait(inst, timeout=180, poll=5, log=None):
 def _stream(inst, tar_src, dest):
     unpack = f"mkdir -p {shlex.quote(dest)} && tar xzf - -C {shlex.quote(dest)}"
     tar = subprocess.Popen(["tar", "czf", "-", *tar_src], stdout=subprocess.PIPE)
-    rc = subprocess.call([*base(inst), unpack], stdin=tar.stdout)
+    try:
+        ssh = subprocess.Popen([*base(inst), unpack], stdin=tar.stdout)
+    finally:
+        tar.stdout.close()
+    rc = ssh.wait()
     tar.wait()
     if rc or tar.returncode:
         raise RuntimeError(f"upload failed (tar={tar.returncode} ssh={rc})")

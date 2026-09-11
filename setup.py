@@ -1,8 +1,8 @@
 from setuptools import setup
 
 setup(
-    name='vast_cli',
-    version='0.1.1',
+    name="vast_cli",
+    version="0.1.1",
     packages=[
         "vast_cli",
         "vast_cli.api",
@@ -16,5 +16,5 @@ setup(
             "vast=vast_cli.__main__:main",
         ],
     },
-    url='https://github.com/2xic/vast-ai-api',
+    url="https://github.com/2xic/vast-ai-api",
 )

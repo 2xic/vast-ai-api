@@ -141,14 +141,17 @@ def destroy_with_retries(inst_id, attempts=5, backoff=3):
     return False
 
 
-def _rent_offer(filters: AvailableInstancesFilter, options, label, log):
+def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=()):
     for offer in get_available_instances(filters):
+        if offer["machine_id"] in skip:
+            continue
         log(
             f"offer {offer['id']} ({offer['num_gpus']}x {offer['gpu']}, "
             f"${offer['price']}/h)"
         )
         try:
-            return create_instance(offer["id"], options, label=LABEL_PREFIX + label)
+            inst_id = create_instance(offer["id"], options, label=LABEL_PREFIX + label)
+            return inst_id, offer["machine_id"]
         except RuntimeError as e:
             if "no_such_ask" in str(e) or "not available" in str(e):
                 log("offer taken between search and create; trying next")
@@ -158,8 +161,18 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log):
 
 
 def _provision_reachable(filters, options, label, log, pubkey, on_account, attempts=3):
+    bad_machines = set()
+    last_failure = None
     for attempt in range(1, attempts + 1):
-        inst_id = _rent_offer(filters, options, label, log)
+        try:
+            inst_id, machine_id = _rent_offer(
+                filters, options, label, log, bad_machines
+            )
+        except RuntimeError as e:
+            if last_failure is None:
+                raise
+            log(f"no offer left outside the {len(bad_machines)} machines that failed")
+            raise last_failure from e
         try:
             if not on_account:
                 attach_ssh_key(inst_id, pubkey)
@@ -174,6 +187,8 @@ def _provision_reachable(filters, options, label, log, pubkey, on_account, attem
             raise
         except Exception as e:
             log(f"node {inst_id} unreachable ({e!r}); destroying")
+            last_failure = e
+            bad_machines.add(machine_id)
             destroy_with_retries(inst_id)
             if attempt == attempts:
                 raise
@@ -278,8 +293,16 @@ def _reset_node(inst, log):
     )
 
 
-def rerun(label, src=".", setup=None, paths=None, cmd=None, grace=None,
-          max_age=None, drain=None):
+def rerun(
+    label,
+    src=".",
+    setup=None,
+    paths=None,
+    cmd=None,
+    grace=None,
+    max_age=None,
+    drain=None,
+):
     def log(m):
         logger.info("[rerun:%s] %s", label, m)
 
@@ -497,7 +520,10 @@ def _decide(inst, p, now, default_max_age, max_restarts):
     if state == "unreachable":
         age = _inst_age(inst, now)
         if age is None:
-            return "warn", "unreachable with no start_date; cannot age out, destroy by hand"
+            return (
+                "warn",
+                "unreachable with no start_date; cannot age out, destroy by hand",
+            )
         return (
             ("destroy", "unreachable > max_age")
             if age > default_max_age
@@ -506,7 +532,10 @@ def _decide(inst, p, now, default_max_age, max_restarts):
     if state == "half-launched":
         age = _inst_age(inst, now)
         if age is None:
-            return "warn", "half-launched with no start_date; cannot age out, destroy by hand"
+            return (
+                "warn",
+                "half-launched with no start_date; cannot age out, destroy by hand",
+            )
         if age > LAUNCH_GRACE_S:
             return "destroy", "half-launched (no JOB) past grace"
         return None, "half-launched, within launch grace"

@@ -196,7 +196,9 @@ def clean_exit_kills_heartbeat():
     hb1 = dexec(f"stat -c %Y {REMOTE_DIR}/HEARTBEAT")[1].strip()
     time.sleep(3)
     hb2 = dexec(f"stat -c %Y {REMOTE_DIR}/HEARTBEAT")[1].strip()
-    assert hb1 and hb1 == hb2, "heartbeat still ticking after clean exit (toucher leaked)"
+    assert hb1 and hb1 == hb2, (
+        "heartbeat still ticking after clean exit (toucher leaked)"
+    )
 
 
 @case

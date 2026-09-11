@@ -1,10 +1,13 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
+import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import types
 
 os.environ.setdefault("VAST_API_KEY", "test")
@@ -30,6 +33,30 @@ import vast_cli.__main__ as main_mod
 from vast_cli.api import client, remote, run
 
 CASES = []
+
+
+@contextlib.contextmanager
+def _fake_clock():
+    real_sleep, real_time = client.time.sleep, client.time.time
+    now = [0.0]
+    client.time.sleep = lambda s: now.__setitem__(0, now[0] + s)
+    client.time.time = lambda: now[0]
+    try:
+        yield now
+    finally:
+        client.time.sleep, client.time.time = real_sleep, real_time
+
+
+@contextlib.contextmanager
+def _patched(mod, **attrs):
+    saved = {k: getattr(mod, k) for k in attrs}
+    for k, v in attrs.items():
+        setattr(mod, k, v)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(mod, k, v)
 
 
 def case(fn):
@@ -173,6 +200,30 @@ def real_ssh_accepts_what_we_build():
 
 
 @case
+def a_receiver_that_dies_mid_push_does_not_hang():
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "big.bin"), "wb") as f:
+        f.write(os.urandom(8 << 20))
+
+    def hung(*a):
+        raise AssertionError("push hung: tar is blocked on a pipe nobody reads")
+
+    real_base = remote.base
+    remote.base = lambda inst: ["sh", "-c", "exit 1"]
+    signal.signal(signal.SIGALRM, hung)
+    signal.alarm(20)
+    try:
+        remote._stream({"id": 7}, ["-C", d, "."], "/root/proj")
+    except RuntimeError:
+        return
+    finally:
+        signal.alarm(0)
+        remote.base = real_base
+        shutil.rmtree(d, ignore_errors=True)
+    raise AssertionError("a receiver that exits must fail the push, not pass it")
+
+
+@case
 def ssh_resolves_by_label_only():
     rows = [
         {"id": 11, "ssh_host": "a", "ssh_port": 1, "status": "running", "label": None},
@@ -239,7 +290,6 @@ def reap_survives_one_bad_instance():
     def fake_probe(inst):
         if inst["id"] == 2:
             raise RuntimeError("probe blew up")
-        return None
 
     run._probe = fake_probe
     results = run.reap(default_max_age=86_400, max_restarts=3)
@@ -262,6 +312,218 @@ def reap_raises_only_when_all_fail():
     except RuntimeError:
         return
     raise AssertionError("all-fail tick should raise (environment broken)")
+
+
+@case
+def a_stuck_docker_pull_fails_instead_of_waiting_out_the_timeout():
+    stuck = {
+        "id": 9,
+        "ssh_host": None,
+        "ssh_port": None,
+        "status": "loading",
+        "status_msg": 'Error response from daemon: Get "https://reg/v2/": EOF',
+    }
+    client.get_running_instances = lambda: iter([stuck])
+    with _fake_clock():
+        try:
+            client.wait_until_ready(9, timeout=600, error_grace=3)
+        except client.InstanceError as e:
+            assert "EOF" in str(e), f"the daemon error must reach the caller: {e}"
+            return
+        except TimeoutError as e:
+            raise AssertionError(
+                "a node in error must not burn the full timeout"
+            ) from e
+    raise AssertionError("a node in error must raise")
+
+
+@case
+def an_empty_status_msg_is_not_treated_as_an_error():
+    seq = [
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": "",
+        },
+        {
+            "id": 9,
+            "ssh_host": "h",
+            "ssh_port": 1,
+            "status": "running",
+            "status_msg": "",
+        },
+    ]
+    client.get_running_instances = lambda: iter([seq.pop(0)])
+    with _fake_clock():
+        inst = client.wait_until_ready(9, timeout=600, error_grace=1)
+    assert inst["ssh_host"] == "h", f"a loading node must still be waited for: {inst}"
+
+
+@case
+def a_node_that_stops_reporting_progress_is_dropped():
+    quiet = {
+        "id": 9,
+        "ssh_host": None,
+        "ssh_port": None,
+        "status": "loading",
+        "status_msg": "pulling image",
+    }
+    client.get_running_instances = lambda: iter([quiet])
+    with _fake_clock() as now:
+        try:
+            client.wait_until_ready(9, timeout=10_000, stall_s=300)
+        except client.InstanceError as e:
+            assert "stuck" in str(e), f"a stalled node must say so: {e}"
+            assert now[0] < 400, f"a stall must fire near stall_s, not late: {now[0]}"
+            return
+    raise AssertionError("a node frozen on one message must not wait out the timeout")
+
+
+@case
+def progress_messages_keep_the_node_alive():
+    msgs = ["pull 10%", "pull 50%", "pull 90%"]
+    seq = [
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": m,
+        }
+        for m in msgs
+    ] + [
+        {"id": 9, "ssh_host": "h", "ssh_port": 1, "status": "running", "status_msg": ""}
+    ]
+    client.get_running_instances = lambda: iter([seq.pop(0)])
+    with _fake_clock():
+        inst = client.wait_until_ready(9, timeout=10_000, stall_s=15)
+    assert inst["ssh_host"] == "h", f"changing messages mean progress: {inst}"
+
+
+@case
+def an_instance_that_vanishes_does_not_hang_until_timeout():
+    client.get_running_instances = lambda: iter([])
+    with _fake_clock():
+        try:
+            client.wait_until_ready(9, timeout=1800, error_grace=3)
+        except client.InstanceError as e:
+            assert "listed" in str(e), f"a vanished node must say so: {e}"
+            return
+        except TimeoutError as e:
+            raise AssertionError("a vanished node must not wait out 1800s") from e
+    raise AssertionError("a vanished node must raise")
+
+
+@case
+def a_broken_machine_is_not_rented_again():
+    offers = [
+        {"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1},
+        {"id": 2, "machine_id": 200, "num_gpus": 1, "gpu": "A100", "price": 1},
+    ]
+    rented = []
+
+    def always_broken(inst_id, log=None):
+        raise client.InstanceError("daemon error")
+
+    patches = dict(
+        get_available_instances=lambda f: iter(offers),
+        create_instance=lambda oid, o, label=None: (rented.append(oid), oid)[1],
+        attach_ssh_key=lambda *a, **k: None,
+        destroy_with_retries=lambda *a, **k: True,
+        wait_until_ready=always_broken,
+    )
+    with _patched(run, **patches), contextlib.suppress(client.InstanceError):
+        run._provision_reachable(None, None, "l", lambda m: None, "k", True, attempts=2)
+    assert rented == [1, 2], f"attempt 2 must skip the failed machine: {rented}"
+
+
+@case
+def exhausting_the_offers_reports_why_the_nodes_failed():
+    offers = [{"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1}]
+
+    def always_broken(inst_id, log=None):
+        raise client.InstanceError("daemon said EOF")
+
+    patches = dict(
+        get_available_instances=lambda f: iter(offers),
+        create_instance=lambda oid, o, label=None: oid,
+        attach_ssh_key=lambda *a, **k: None,
+        destroy_with_retries=lambda *a, **k: True,
+        wait_until_ready=always_broken,
+    )
+    with _patched(run, **patches):
+        try:
+            run._provision_reachable(
+                None, None, "l", lambda m: None, "k", True, attempts=3
+            )
+        except client.InstanceError as e:
+            assert "EOF" in str(e), f"the real cause must survive: {e}"
+            return
+        except RuntimeError as e:
+            raise AssertionError(f"pool exhaustion must not hide the cause: {e}") from e
+    raise AssertionError("an all-bad pool must raise")
+
+
+@case
+def a_node_that_flaps_between_error_and_ok_is_still_dropped():
+    seq = [
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": "pulling" if i % 2 else "Error: transient",
+        }
+        for i in range(60)
+    ]
+    client.get_running_instances = lambda: iter([seq.pop(0)])
+    with _fake_clock():
+        try:
+            client.wait_until_ready(9, timeout=10_000, error_grace=6, stall_s=10_000)
+        except client.InstanceError as e:
+            assert "transient" in str(e), f"the flapping error must surface: {e}"
+            return
+    raise AssertionError("a node flapping in and out of error must not run forever")
+
+
+@case
+def a_message_that_changes_after_an_error_resets_the_stall_clock():
+    seq = [
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": "pulling",
+        },
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": "Error: transient",
+        },
+        {
+            "id": 9,
+            "ssh_host": None,
+            "ssh_port": None,
+            "status": "loading",
+            "status_msg": "pulling",
+        },
+        {
+            "id": 9,
+            "ssh_host": "h",
+            "ssh_port": 1,
+            "status": "running",
+            "status_msg": "",
+        },
+    ]
+    client.get_running_instances = lambda: iter([seq.pop(0)])
+    with _fake_clock():
+        inst = client.wait_until_ready(9, timeout=10_000, error_grace=6, stall_s=15)
+    assert inst["ssh_host"] == "h", f"an error poll must not freeze the clock: {inst}"
 
 
 def main():

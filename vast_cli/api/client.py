@@ -78,6 +78,7 @@ def get_available_instances(options: AvailableInstancesFilter):
     for i in results["offers"]:
         yield {
             "id": i["id"],
+            "machine_id": i["machine_id"],
             "gpu": i["gpu_name"],
             "num_gpus": i["num_gpus"],
             "price": i["dph_total"],
@@ -140,21 +141,56 @@ def _is_ready(inst):
     )
 
 
-def wait_until_ready(instance_id, timeout=600, poll=10, log=None):
+class InstanceError(RuntimeError):
+    pass
+
+
+def _failure(inst):
+    if not inst:
+        return None
+    if inst["status"] == "exited":
+        return inst["status"]
+    msg = inst.get("status_msg") or ""
+    return msg if "error" in msg.lower() else None
+
+
+def wait_until_ready(
+    instance_id, timeout=1800, poll=10, log=None, error_grace=6, stall_s=60
+):
     deadline = time.time() + timeout
+    errors = 0
+    mark = None
     while time.time() < deadline:
         try:
             inst = next(
                 (i for i in get_running_instances() if i["id"] == instance_id), None
             )
+            listed = True
         except Exception as e:
-            inst = None
+            inst, listed = None, False
             if log:
                 log(f"instance list failed, retrying: {e}")
         if _is_ready(inst):
             return inst
-        if log and inst is not None:
-            log(f"status={inst['status']}, ssh addr pending")
+        if inst is not None:
+            state = (inst["status"], inst["status_msg"])
+            if mark is None or mark[0] != state:
+                mark = (state, time.time())
+        fail = "no longer listed" if listed and inst is None else _failure(inst)
+        if fail:
+            errors += 1
+            if log:
+                log(f"error ({errors}/{error_grace}): {fail}")
+            if errors >= error_grace:
+                raise InstanceError(f"instance {instance_id} failed: {fail}")
+        elif inst is not None:
+            if time.time() - mark[1] >= stall_s:
+                raise InstanceError(
+                    f"instance {instance_id} stuck in {mark[0][0]} for {stall_s}s: "
+                    f"{mark[0][1]!r}"
+                )
+            if log:
+                log(f"status={inst['status']}, not ready yet")
         time.sleep(poll)
     raise TimeoutError(f"instance {instance_id} not ready within {timeout}s")
 
@@ -200,6 +236,7 @@ def _instance_row(instance):
         "open_ports": _fmt_ports(public_ip, ports),
         "public_ip": public_ip,
         "status": instance.get("actual_status"),
+        "status_msg": (instance.get("status_msg") or "").strip(),
         "label": instance.get("label"),
         "start_date": instance.get("start_date"),
     }

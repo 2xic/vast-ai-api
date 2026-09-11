@@ -23,17 +23,24 @@ def _confirm(prompt):
     return input(prompt).strip().lower() in ("y", "yes")
 
 
+def _state_text(r):
+    state = r["state"]
+    if state == "exited":
+        state += f"({r['done']})" + (" HOLD" if r["hold"] else "")
+    return state
+
+
 def _print_ps(rows):
+    states = [_state_text(r) for r in rows]
+    lw = max([len("LABEL"), *(len(r["label"]) for r in rows)])
+    sw = max([len("STATE"), *(len(s) for s in states)])
     print(
-        f"{'ID':>10}  {'LABEL':<20} {'STATE':<18} "
+        f"{'ID':>10}  {'LABEL':<{lw}} {'STATE':<{sw}} "
         f"{'AGE':<10} {'LEFT':<10} {'GPU%':<8} RESTARTS"
     )
-    for r in rows:
-        state = r["state"]
-        if state == "exited":
-            state += f"({r['done']})" + (" HOLD" if r["hold"] else "")
+    for r, state in zip(rows, states, strict=True):
         print(
-            f"{r['id']:>10}  {r['label']:<20} {state:<18} "
+            f"{r['id']:>10}  {r['label']:<{lw}} {state:<{sw}} "
             f"{_fmt_dur(r['age_s']):<10} {_fmt_dur(r['left_s']):<10} "
             f"{r['gpu']:<8} {r['restarts']}"
         )
@@ -177,9 +184,7 @@ def main():
         "max-age", help="change the max-age deadline on a running node (no restart)"
     )
     ma.add_argument("label", help="label of the node")
-    ma.add_argument(
-        "seconds", type=int, help="new max-age in seconds from launch time"
-    )
+    ma.add_argument("seconds", type=int, help="new max-age in seconds from launch time")
 
     clean_p = sub.add_parser("clean", help="destroy all managed (vrun:) instances")
     clean_p.add_argument("--force", action="store_true", help="skip confirmation")
