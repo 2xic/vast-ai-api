@@ -124,7 +124,7 @@ def pick_offer(options: AvailableInstancesFilter):
 @dataclass
 class InstanceOptions:
     # images can be found here https://cloud.vast.ai/api/v0/users/undefined/templates/null/
-    docker_image = "pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime"
+    docker_image = "pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime"
     # options to docker, i.e if you want to open a port
     # ["-p 8081:8081", "-p 8082:8082"]
     docker_options: list[str] = field(default_factory=list)

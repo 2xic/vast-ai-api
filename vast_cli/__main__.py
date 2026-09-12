@@ -87,7 +87,7 @@ def main():
         "--image",
         default=None,
         metavar="REPO:TAG",
-        help="docker image, e.g. 'pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime'",
+        help="docker image, e.g. 'pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime'",
     )
     launch_p.add_argument("--price", type=float, default=10.0)
     launch_p.add_argument("--up", type=float, default=10.0)
