@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # ///
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import types
+import urllib.parse
 
 os.environ.setdefault("VAST_API_KEY", "test")
 
@@ -75,6 +77,96 @@ def case(fn):
     return fn
 
 
+def _raises(exc, fn, *a, **k):
+    try:
+        fn(*a, **k)
+    except exc as e:
+        return str(e)
+    raise AssertionError(f"{fn.__name__} must raise {exc.__name__}")
+
+
+_FILTER_4090 = client.AvailableInstancesFilter(gpu_name="RTX 4090")
+
+
+def _raw_offer(n):
+    return {
+        "id": n,
+        "machine_id": n,
+        "gpu_name": "RTX 4090",
+        "num_gpus": 1,
+        "dph_total": 0.4,
+        "score": 1,
+        "disk_space": 50,
+        "gpu_ram": 24,
+        "verified": True,
+    }
+
+
+def _market(rows, cap=64):
+    asked = []
+
+    def fake(method, url):
+        if "gpu_names" in url:
+            return {"success": True, "gpu_names": sorted({r["gpu_name"] for r in rows})}
+        q = json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0])
+        asked.append(q)
+        assert "offset" not in q, "the bundles API rejects offset outright"
+        hits = [r for r in rows if r["gpu_name"] == q["gpu_name"]["eq"]]
+        if q.get("verified"):
+            hits = [r for r in hits if r["verified"]]
+        hits.sort(key=lambda r: r["dph_total"], reverse=q["order"][0][1] == "desc")
+        return {"offers": hits[: min(q["limit"], cap)]}
+
+    return fake, asked
+
+
+@case
+def a_search_never_asks_for_more_than_the_server_returns():
+    fake, asked = _market([_raw_offer(1)])
+    with _patched(client, _request=fake):
+        list(client.get_available_instances(_FILTER_4090, limit=5000))
+    assert asked[0]["limit"] == 64, f"the server caps a page at 64: {asked[0]['limit']}"
+
+
+@case
+def every_gpu_model_is_priced_by_its_own_query():
+    rows = [_raw_offer(1), {**_raw_offer(2), "gpu_name": "GTX 1080", "dph_total": 0.02}]
+    fake, asked = _market(rows)
+    with _patched(client, _request=fake):
+        got = run.list_gpus()
+    assert got == [("GTX 1080", 0.02), ("RTX 4090", 0.4)], f"one row per model: {got}"
+    assert len(asked) == 2, f"one query per model, not one for the market: {len(asked)}"
+
+
+@case
+def the_cheapest_offer_of_a_model_is_the_one_reported():
+    rows = [_raw_offer(1), {**_raw_offer(2), "dph_total": 0.19}]
+    fake, asked = _market(rows)
+    with _patched(client, _request=fake):
+        got = run.list_gpus()
+    assert got == [("RTX 4090", 0.19)], f"the server must sort by price for us: {got}"
+    assert asked[0]["order"] == [["dph_total", "asc"]], f"wrong order: {asked[0]}"
+    assert asked[0]["limit"] == 1, f"only the cheapest row is needed: {asked[0]}"
+
+
+@case
+def a_model_with_no_verified_host_is_hidden_until_you_ask():
+    rows = [{**_raw_offer(1), "gpu_name": "GTX 1080", "verified": False}]
+    fake, _ = _market(rows)
+    with _patched(client, _request=fake):
+        assert run.list_gpus() == [], "an unverified-only model must not be listed"
+        got = run.list_gpus(verified=False)
+    assert got == [("GTX 1080", 0.4)], f"--any-host must surface it: {got}"
+
+
+@case
+def launch_still_takes_the_highest_scoring_offer_first():
+    fake, asked = _market([_raw_offer(1)])
+    with _patched(client, _request=fake):
+        client.pick_offer(_FILTER_4090)
+    assert asked[0]["order"] == [["score", "desc"]], f"launch order changed: {asked[0]}"
+
+
 @case
 def malformed_instances_are_skipped_not_fatal():
     body = {
@@ -95,8 +187,8 @@ def malformed_instances_are_skipped_not_fatal():
             {"id": 3, "ports": {"22/tcp": "garbage"}, "label": "vrun:d"},
         ]
     }
-    client._request = lambda *a, **k: body
-    rows = list(client.get_running_instances())
+    with _patched(client, _request=lambda *a, **k: body):
+        rows = list(client.get_running_instances())
     ids = sorted(r["id"] for r in rows)
     assert ids == [1, 2, 3], f"expected well-formed ids kept, got {ids}"
     row2 = next(r for r in rows if r["id"] == 2)
@@ -108,11 +200,11 @@ def malformed_instances_are_skipped_not_fatal():
 
 @case
 def missing_instances_key_still_raises():
-    client._request = lambda *a, **k: {"success": False, "msg": "boom"}
-    try:
-        list(client.get_running_instances())
-    except RuntimeError:
-        return
+    with _patched(client, _request=lambda *a, **k: {"success": False, "msg": "boom"}):
+        try:
+            list(client.get_running_instances())
+        except RuntimeError:
+            return
     raise AssertionError("total API failure should still raise")
 
 
@@ -171,6 +263,28 @@ def everything_after_the_label_goes_to_ssh_verbatim():
     sys.argv = ["vast", "ssh", "web", "--print"]
     main_mod.main()
     assert execed[3][-1] == "--print", "after the label, even our flags go to ssh"
+
+
+def _launch_filter(argv):
+    seen = []
+    with _patched(
+        main_mod.run,
+        local_pubkey=lambda: "k",
+        key_on_account=lambda k: True,
+        launch=lambda *a, **k: seen.append(a[2]),
+    ):
+        sys.argv = argv
+        main_mod.main()
+    return seen[0]
+
+
+@case
+def launch_and_gpus_agree_on_which_hosts_count():
+    base = ["vast", "launch", "/tmp", "--cmd", "x"]
+    assert _launch_filter(base).verified, "launch must vet hosts by default"
+    assert not _launch_filter([*base, "--any-host"]).verified, (
+        "a price gpus --any-host quotes must be one launch can rent at"
+    )
 
 
 @case
@@ -285,8 +399,8 @@ def jupyter_nodes_get_the_offset_proxy_port():
             {"id": 3, "ssh_host": "h", "ssh_port": None},
         ]
     }
-    client._request = lambda *a, **k: body
-    ports = {r["id"]: r["ssh_port"] for r in client.get_running_instances()}
+    with _patched(client, _request=lambda *a, **k: body):
+        ports = {r["id"]: r["ssh_port"] for r in client.get_running_instances()}
     assert ports[1] == 101, f"jupyter runtype needs ssh_port+1, got {ports[1]}"
     assert ports[2] == 100, f"plain ssh runtype must not shift, got {ports[2]}"
     assert ports[3] is None, f"a node with no port must stay None, got {ports[3]}"
@@ -428,11 +542,131 @@ def an_instance_that_vanishes_does_not_hang_until_timeout():
     raise AssertionError("a vanished node must raise")
 
 
+class _HtmlErrorPage:
+    status_code = 502
+    text = "<html><body>502 Bad Gateway</body></html>"
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+@case
+def an_html_error_page_names_the_status_not_the_json_parser():
+    sess = types.SimpleNamespace(request=lambda *a, **k: _HtmlErrorPage())
+    with _patched(client, _session=sess):
+        msg = _raises(RuntimeError, client._request, "PUT", "https://x/?api_key=secret")
+    assert "502" in msg and "Bad Gateway" in msg, f"the user must see why: {msg}"
+    assert "secret" not in msg, f"the api key LEAKED into the error: {msg}"
+
+
+def _launch_that_fails(boom=None):
+    destroyed = []
+
+    def default_boom(*a, **k):
+        raise RuntimeError("setup failed (rc=1)")
+
+    with (
+        _patched(
+            run,
+            _find_existing=lambda label: [],
+            local_pubkey=lambda: "k",
+            key_on_account=lambda k: True,
+            _provision_reachable=lambda *a, **k: (5, {"id": 5, "ssh": "ssh://x"}),
+            _push_and_start=boom or default_boom,
+            destroy_with_retries=destroyed.append,
+        ),
+        contextlib.suppress(RuntimeError, KeyboardInterrupt),
+    ):
+        run.launch("/tmp", "c", None, None, "job")
+    return destroyed
+
+
+@case
+def a_broken_launch_does_not_leak_a_paid_node():
+    left = _launch_that_fails()
+    assert left == [5], f"a failed launch must destroy the node: {left}"
+
+
+@case
+def a_ctrl_c_mid_launch_still_destroys_the_node():
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    left = _launch_that_fails(interrupt)
+    assert left == [5], f"ctrl-c must not leak a paid node: {left}"
+
+
+@case
+def a_held_node_is_still_reaped_once_it_ages_out():
+    p = {"job": {"launched_at": 0}, "has_pgid": False, "hold": True}
+    action = run._decide_running(p, run.LAUNCH_GRACE_S + 100, 3)[0]
+    assert action == "destroy", f"a hold must not buy a node forever: {action}"
+
+
+def _tty(yes):
+    return types.SimpleNamespace(
+        stderr=types.SimpleNamespace(
+            isatty=lambda: yes, write=lambda s: None, flush=lambda: None
+        )
+    )
+
+
+def _tree():
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "sub"))
+    for path, n in (("a.bin", 300), ("sub/b.bin", 700)):
+        with open(os.path.join(root, path), "wb") as f:
+            f.write(b"x" * n)
+    return root
+
+
+@case
+def the_push_bar_counts_exactly_the_bytes_tar_reports():
+    root = _tree()
+    tar = subprocess.Popen(
+        ["tar", "czf", "-", "-v", "-C", root, "."],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    seen = []
+    with _patched(remote, sys=_tty(True)):
+        remote._track(
+            tar.stderr, remote._sizes(root, None), lambda d, t: seen.append(d)
+        )
+    assert seen[-1] == 1000, f"tar's names must match the size map, got {seen}"
+    assert seen == sorted(seen), f"progress must never go backwards: {seen}"
+
+
+@case
+def a_push_to_a_log_file_pays_for_no_progress_bar():
+    got = []
+    with _patched(
+        remote,
+        sys=_tty(False),
+        _stream=lambda i, s, d, sizes=None: got.append(sizes),
+    ):
+        remote.put({"id": 7}, _tree(), "/root/proj")
+    assert got == [None], f"a non-tty push must not turn on tar -v: {got}"
+
+
+@case
+def a_single_file_push_still_knows_its_size():
+    got = []
+    path = os.path.join(_tree(), "a.bin")
+    with _patched(
+        remote,
+        sys=_tty(True),
+        _stream=lambda i, s, d, sizes=None: got.append(sizes),
+    ):
+        remote.put({"id": 7}, path, "/root/proj")
+    assert got == [{"a.bin": 300}], f"a lone file must size itself: {got}"
+
+
 @case
 def a_dropped_push_is_retried_not_fatal():
     calls = []
 
-    def flaky(inst, tar_src, dest):
+    def flaky(inst, tar_src, dest, sizes=None):
         calls.append(dest)
         return (0, 0) if len(calls) > 1 else (2, 255)
 
@@ -445,7 +679,7 @@ def a_dropped_push_is_retried_not_fatal():
 def a_push_that_never_lands_still_fails():
     calls = []
 
-    def always_drops(inst, tar_src, dest):
+    def always_drops(inst, tar_src, dest, sizes=None):
         calls.append(dest)
         return (2, 255)
 
@@ -463,7 +697,7 @@ def a_push_that_never_lands_still_fails():
 def a_local_tar_failure_is_not_retried():
     calls = []
 
-    def bad_tar(inst, tar_src, dest):
+    def bad_tar(inst, tar_src, dest, sizes=None):
         calls.append(dest)
         return (2, 0)
 

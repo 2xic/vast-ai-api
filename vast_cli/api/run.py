@@ -1,8 +1,10 @@
 import base64
+import dataclasses
 import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from vast_cli.api import remote
 from vast_cli.api.client import (
@@ -13,6 +15,7 @@ from vast_cli.api.client import (
     delete_instance,
     get_available_instances,
     get_running_instances,
+    gpu_names,
     list_ssh_keys,
     wait_until_ready,
 )
@@ -156,6 +159,7 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=())
             if "no_such_ask" in str(e) or "not available" in str(e):
                 log("offer taken between search and create; trying next")
                 continue
+            log(f"create failed: {e}")
             raise
     raise RuntimeError("no available offer could be rented (all matches taken)")
 
@@ -608,14 +612,25 @@ def reap(default_max_age=86400, max_restarts=3):
     return results
 
 
-def list_gpus(max_price=1000.0, min_gpu=1):
-    cheapest = {}
-    filters = AvailableInstancesFilter(min_gpu=min_gpu, max_dollar_price_hour=max_price)
-    for o in get_available_instances(filters):
-        name = o["gpu"]
-        if name not in cheapest or o["price"] < cheapest[name]:
-            cheapest[name] = o["price"]
-    return sorted(cheapest.items())
+def list_gpus(max_price=1000.0, min_gpu=1, verified=True):
+    base_filter = AvailableInstancesFilter(
+        min_gpu=min_gpu, max_dollar_price_hour=max_price, verified=verified
+    )
+
+    def cheapest(name):
+        offer = next(
+            get_available_instances(
+                dataclasses.replace(base_filter, gpu_name=name),
+                order=[["dph_total", "asc"]],
+                limit=1,
+            ),
+            None,
+        )
+        return (name, offer["price"]) if offer else None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = pool.map(cheapest, gpu_names())
+    return sorted(r for r in rows if r)
 
 
 def list_managed():

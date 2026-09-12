@@ -3,6 +3,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -159,21 +160,63 @@ def wait(inst, timeout=600, poll=5, log=None):
         time.sleep(poll)
 
 
-def _stream_once(inst, tar_src, dest):
+def _draw(done, total):
+    pct = min(100, 100 * done // total) if total else 100
+    bar = "#" * (pct // 5)
+    sys.stderr.write(
+        f"\r[push] {bar:<20} {pct:3d}%  {done / 1e6:.1f}/{total / 1e6:.1f} MB"
+    )
+    sys.stderr.flush()
+
+
+def _track(stderr, sizes, draw):
+    total = sum(sizes.values())
+    done = 0
+    for raw in stderr:
+        name = raw.decode("utf-8", "replace").strip()
+        done += sizes.get(name[2:] if name.startswith("./") else name, 0)
+        draw(done, total)
+    draw(total, total)
+    sys.stderr.write("\n")
+
+
+def _stream_once(inst, tar_src, dest, sizes=None):
     unpack = f"mkdir -p {shlex.quote(dest)} && tar xzf - -C {shlex.quote(dest)}"
-    tar = subprocess.Popen(["tar", "czf", "-", *tar_src], stdout=subprocess.PIPE)
+    tar = subprocess.Popen(
+        ["tar", "czf", "-", *(["-v"] if sizes else []), *tar_src],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if sizes else None,
+    )
     try:
         ssh = subprocess.Popen([*base(inst), unpack], stdin=tar.stdout)
     finally:
         tar.stdout.close()
+    if sizes:
+        _track(tar.stderr, sizes, _draw)
     rc = ssh.wait()
     tar.wait()
     return tar.returncode, rc
 
 
-def _stream(inst, tar_src, dest, attempts=5, backoff=5):
+def _sizes(local, files):
+    if files is None:
+        files = [
+            os.path.relpath(os.path.join(root, f), local)
+            for root, _, names in os.walk(local)
+            for f in names
+        ]
+    out = {}
+    for f in files:
+        try:
+            out[f] = os.path.getsize(os.path.join(local, f))
+        except OSError:
+            out[f] = 0
+    return out
+
+
+def _stream(inst, tar_src, dest, sizes=None, *, attempts=5, backoff=5):
     for attempt in range(1, attempts + 1):
-        tar_rc, rc = _stream_once(inst, tar_src, dest)
+        tar_rc, rc = _stream_once(inst, tar_src, dest, sizes)
         if not (tar_rc or rc):
             return
         if rc == 0:
@@ -202,8 +245,12 @@ def put(inst, local, dest, files=None):
         if not files:
             return
         src = ["-C", local, "--", *files]
+        root = local
     elif os.path.isdir(local):
         src = ["-C", local, "."]
+        root = local
     else:
-        src = ["-C", os.path.dirname(local) or ".", os.path.basename(local)]
-    _stream(inst, src, dest)
+        root = os.path.dirname(local) or "."
+        files = [os.path.basename(local)]
+        src = ["-C", root, files[0]]
+    _stream(inst, src, dest, _sizes(root, files) if sys.stderr.isatty() else None)

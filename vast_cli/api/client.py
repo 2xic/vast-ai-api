@@ -14,7 +14,7 @@ load_dotenv()
 
 logger = logging.getLogger("vast_cli")
 
-api_url = "https://cloud.vast.ai/api/v0/"
+api_url = "https://cloud.vast.ai/api/v0"
 
 _session = requests.Session()
 _session.mount(
@@ -37,7 +37,14 @@ def wrap_url(url, query_args=None):
 
 
 def _request(method, url, **kwargs):
-    return _session.request(method, url, timeout=30, **kwargs).json()
+    r = _session.request(method, url, timeout=30, **kwargs)
+    try:
+        return r.json()
+    except ValueError:
+        body = " ".join(r.text.split())[:300] or "<empty>"
+        raise RuntimeError(
+            f"{method} {r.status_code} non-json response: {body}"
+        ) from None
 
 
 def _api(method, url, what, **kwargs):
@@ -56,36 +63,55 @@ class AvailableInstancesFilter:
     mbps_up: float = 10
     mbps_down: float = 10
     gpu_name: str = None
+    verified: bool = True
 
 
-def get_available_instances(options: AvailableInstancesFilter):
+OFFER_LIMIT = 64
+
+
+def _offer(i):
+    return {
+        "id": i["id"],
+        "machine_id": i["machine_id"],
+        "gpu": i["gpu_name"],
+        "num_gpus": i["num_gpus"],
+        "price": i["dph_total"],
+        "score": i["score"],
+        "disk": i["disk_space"],
+        "gpu_ram": i["gpu_ram"],
+    }
+
+
+def gpu_names():
+    body = _request("GET", f"{api_url}/gpu_names/unique/")
+    if not body.get("success"):
+        raise RuntimeError(f"gpu_names failed: {body}")
+    return body["gpu_names"]
+
+
+def get_available_instances(
+    options: AvailableInstancesFilter, order=None, limit=OFFER_LIMIT
+):
     search = {
         "disk_space": {"gte": options.min_disk_space_gb},
-        "verified": {"eq": True},
         "rentable": {"eq": True},
         "num_gpus": {"gte": options.min_gpu},
         "dph_total": {"lte": options.max_dollar_price_hour},
         "inet_up": {"gte": options.mbps_up},
         "inet_down": {"gte": options.mbps_down},
-        "order": [["score", "desc"]],
+        "order": order or [["score", "desc"]],
+        "limit": min(limit, OFFER_LIMIT),
         "type": "ask",  # bid or ask, ask = on - demand
     }
+    if options.verified:
+        search["verified"] = {"eq": True}
     if options.gpu_name:
         search["gpu_name"] = {"eq": options.gpu_name}
     results = _request("GET", wrap_url(f"{api_url}/bundles/", {"q": search}))
     if "offers" not in results:
         raise RuntimeError(f"bundles search returned no 'offers': {results}")
     for i in results["offers"]:
-        yield {
-            "id": i["id"],
-            "machine_id": i["machine_id"],
-            "gpu": i["gpu_name"],
-            "num_gpus": i["num_gpus"],
-            "price": i["dph_total"],
-            "score": i["score"],
-            "disk": i["disk_space"],
-            "gpu_ram": i["gpu_ram"],
-        }
+        yield _offer(i)
 
 
 def pick_offer(options: AvailableInstancesFilter):

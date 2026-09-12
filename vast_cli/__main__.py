@@ -46,6 +46,14 @@ def _print_ps(rows):
         )
 
 
+def _add_any_host(p):
+    p.add_argument(
+        "--any-host",
+        action="store_true",
+        help="include unverified hosts (cheaper, slightly lower reliability score)",
+    )
+
+
 def _split_ssh(argv):
     if not argv or argv[0] != "ssh":
         return argv, []
@@ -107,6 +115,7 @@ def main():
         metavar="LOCAL[:REMOTE]",
         help="extra file/dir to push (repeatable); REMOTE relative to the project dir",
     )
+    _add_any_host(launch_p)
 
     rr = sub.add_parser(
         "rerun",
@@ -195,6 +204,7 @@ def main():
     gpus_p = sub.add_parser("gpus", help="list rentable GPU models and cheapest price")
     gpus_p.add_argument("--price", type=float, default=1000.0, help="max $/hour")
     gpus_p.add_argument("--gpus", type=int, default=1, help="min gpu count")
+    _add_any_host(gpus_p)
 
     argv, ssh_args = _split_ssh(sys.argv[1:])
     args = parser.parse_args(argv)
@@ -219,6 +229,7 @@ def _dispatch(args):
             mbps_up=args.up,
             mbps_down=args.down,
             gpu_name=args.gpu,
+            verified=not args.any_host,
         )
         options = InstanceOptions()
         options.disk_space = args.disk
@@ -292,7 +303,9 @@ def _dispatch(args):
         inst_id = run.destroy(args.label)
         print(f"[destroy] {args.label} -> instance {inst_id}")
     elif args.command == "gpus":
-        for name, price in run.list_gpus(max_price=args.price, min_gpu=args.gpus):
+        for name, price in run.list_gpus(
+            max_price=args.price, min_gpu=args.gpus, verified=not args.any_host
+        ):
             print(f"{name:20} from ${price:.3f}/h")
 
 
