@@ -54,6 +54,15 @@ def _add_any_host(p):
     )
 
 
+def _add_bundle_flag(p):
+    p.add_argument(
+        "--bundle",
+        default=None,
+        metavar="TARBALL",
+        help="a 'vast bundle' tarball to push instead of walking git",
+    )
+
+
 def _split_ssh(argv):
     if not argv or argv[0] != "ssh":
         return argv, []
@@ -71,7 +80,10 @@ def main():
         "launch",
         help="provision a node, push a dir, start a command detached, record it, exit",
     )
-    launch_p.add_argument("src", help="local file or dir to push to /root/proj")
+    launch_p.add_argument(
+        "src", nargs="?", help="local file or dir to push to /root/proj"
+    )
+    _add_bundle_flag(launch_p)
     launch_p.add_argument(
         "--cmd", required=True, help="command to run in /root/proj, e.g. 'uv run x.py'"
     )
@@ -117,12 +129,29 @@ def main():
     )
     _add_any_host(launch_p)
 
+    b = sub.add_parser(
+        "bundle",
+        help="pack tracked files and --path extras into one tarball",
+    )
+    b.add_argument("src", nargs="?", default=".", help="local git dir to pack")
+    b.add_argument(
+        "-o", "--out", default="-", help="output tarball ('-' for stdout, the default)"
+    )
+    b.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="LOCAL[:REMOTE]",
+        help="extra file/dir to pack (repeatable); REMOTE relative to the project dir",
+    )
+
     rr = sub.add_parser(
         "rerun",
         help="re-push files and restart the job on an existing node (edit-run loop)",
     )
     rr.add_argument("label", help="label of the running node to rerun on")
     rr.add_argument("src", nargs="?", default=".", help="local dir to re-push")
+    _add_bundle_flag(rr)
     rr.add_argument("--cmd", default=None, help="override the command (default: reuse)")
     rr.add_argument("--setup", default=None, help="command run once before the job")
     rr.add_argument(
@@ -220,42 +249,58 @@ def main():
         sys.exit(1)
 
 
+def _do_bundle(args):
+    n = run.bundle(args.src, args.out, args.path)
+    print(f"[bundle] {n} files -> {args.out}", file=sys.stderr)
+
+
+def _do_launch(args):
+    if not args.bundle and not args.src:
+        sys.exit("launch needs a src dir or --bundle")
+    filters = AvailableInstancesFilter(
+        min_gpu=args.gpus,
+        min_disk_space_gb=args.disk,
+        max_dollar_price_hour=args.price,
+        mbps_up=args.up,
+        mbps_down=args.down,
+        gpu_name=args.gpu,
+        verified=not args.any_host,
+    )
+    options = InstanceOptions()
+    options.disk_space = args.disk
+    if args.image:
+        options.docker_image = args.image
+    label = args.label or os.path.basename(os.path.normpath(args.src or "."))
+    if not label:
+        sys.exit("could not derive a label; pass --label")
+    attach = False
+    pubkey = run.local_pubkey()
+    if not run.key_on_account(pubkey):
+        print(f"this ssh key is NOT on your vast account:\n  {pubkey}")
+        if not _confirm("attach it so the node is reachable? [y/N] "):
+            sys.exit("aborted: no ssh key attached, the node would be unreachable")
+        attach = True
+    run.launch(
+        args.src,
+        args.cmd,
+        filters,
+        options,
+        label,
+        setup=args.setup,
+        grace=args.grace,
+        max_age=args.max_age,
+        drain=args.drain,
+        paths=args.path,
+        attach_missing_key=attach,
+        bundle=args.bundle,
+    )
+
+
 def _dispatch(args):
-    if args.command == "launch":
-        filters = AvailableInstancesFilter(
-            min_gpu=args.gpus,
-            min_disk_space_gb=args.disk,
-            max_dollar_price_hour=args.price,
-            mbps_up=args.up,
-            mbps_down=args.down,
-            gpu_name=args.gpu,
-            verified=not args.any_host,
-        )
-        options = InstanceOptions()
-        options.disk_space = args.disk
-        if args.image:
-            options.docker_image = args.image
-        label = args.label or os.path.basename(os.path.normpath(args.src))
-        attach = False
-        pubkey = run.local_pubkey()
-        if not run.key_on_account(pubkey):
-            print(f"this ssh key is NOT on your vast account:\n  {pubkey}")
-            if not _confirm("attach it so the node is reachable? [y/N] "):
-                sys.exit("aborted: no ssh key attached, the node would be unreachable")
-            attach = True
-        run.launch(
-            args.src,
-            args.cmd,
-            filters,
-            options,
-            label,
-            setup=args.setup,
-            grace=args.grace,
-            max_age=args.max_age,
-            drain=args.drain,
-            paths=args.path,
-            attach_missing_key=attach,
-        )
+    if args.command == "bundle":
+        _do_bundle(args)
+    elif args.command == "launch":
+        _do_launch(args)
     elif args.command == "rerun":
         run.rerun(
             args.label,
@@ -266,6 +311,7 @@ def _dispatch(args):
             grace=args.grace,
             max_age=args.max_age,
             drain=args.drain,
+            bundle=args.bundle,
         )
     elif args.command == "exec":
         sys.exit(run.exec_on(args.label, cmd=" ".join(args.cmd) or None))

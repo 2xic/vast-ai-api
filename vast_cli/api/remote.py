@@ -176,7 +176,6 @@ def _track(stderr, sizes, draw):
         name = raw.decode("utf-8", "replace").strip()
         done += sizes.get(name[2:] if name.startswith("./") else name, 0)
         draw(done, total)
-    draw(total, total)
     sys.stderr.write("\n")
 
 
@@ -214,6 +213,18 @@ def _sizes(local, files):
     return out
 
 
+def _backoff(attempt, attempts, detail, backoff):
+    delay = backoff * 2 ** (attempt - 1)
+    logger.warning(
+        "[push] attempt %s/%s failed (%s); retrying in %ss",
+        attempt,
+        attempts,
+        detail,
+        delay,
+    )
+    time.sleep(delay)
+
+
 def _stream(inst, tar_src, dest, sizes=None, *, attempts=5, backoff=5):
     for attempt in range(1, attempts + 1):
         tar_rc, rc = _stream_once(inst, tar_src, dest, sizes)
@@ -221,20 +232,28 @@ def _stream(inst, tar_src, dest, sizes=None, *, attempts=5, backoff=5):
             return
         if rc == 0:
             raise RuntimeError(f"upload failed locally (tar={tar_rc})")
+        detail = f"tar={tar_rc} ssh={rc}"
+        if attempt == attempts:
+            raise RuntimeError(f"upload failed after {attempts} attempts ({detail})")
+        _backoff(attempt, attempts, detail, backoff)
+
+
+def put_bundle(inst, tarball, dest, *, attempts=5, backoff=5):
+    tarball = os.path.expanduser(tarball)
+    if not os.path.isfile(tarball):
+        raise RuntimeError(f"put_bundle: {tarball} not found")
+    q = shlex.quote(dest)
+    unpack = f"mkdir -p {q} && tar xzf - -C {q}"
+    for attempt in range(1, attempts + 1):
+        with open(tarball, "rb") as fh:
+            rc = subprocess.call([*base(inst), unpack], stdin=fh)
+        if rc == 0:
+            return
         if attempt == attempts:
             raise RuntimeError(
-                f"upload failed after {attempts} attempts (tar={tar_rc} ssh={rc})"
+                f"bundle upload failed after {attempts} attempts (rc={rc})"
             )
-        delay = backoff * 2 ** (attempt - 1)
-        logger.warning(
-            "[push] attempt %s/%s failed (tar=%s ssh=%s); retrying in %ss",
-            attempt,
-            attempts,
-            tar_rc,
-            rc,
-            delay,
-        )
-        time.sleep(delay)
+        _backoff(attempt, attempts, f"rc={rc}", backoff)
 
 
 def put(inst, local, dest, files=None):

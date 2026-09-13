@@ -3,6 +3,8 @@ import dataclasses
 import json
 import logging
 import os
+import sys
+import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -99,22 +101,67 @@ def key_on_account(pubkey):
     return any(_key_id(k) == _key_id(pubkey) for k in _account_pubkeys())
 
 
-def push_dir(inst, local_dir):
-    remote.put(inst, local_dir, REMOTE_DIR, files=remote.git_files(local_dir))
+def push_dir(inst, src):
+    local = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
+    remote.put(inst, local, REMOTE_DIR, files=remote.git_files(local))
 
 
 def push_path(inst, spec):
+    local, dest = _split_path_spec(spec)
+    if not dest.startswith("/"):
+        dest = f"{REMOTE_DIR}/{dest}"
+    remote.put(inst, local, dest)
+
+
+def _split_path_spec(spec):
     local, _, dest = spec.partition(":")
     local = os.path.expanduser(local)
     if not os.path.exists(local):
         raise RuntimeError(f"--path source not found: {local}")
     if os.path.isdir(local):
-        dest = dest or os.path.basename(os.path.normpath(local))
+        return local, dest or os.path.basename(os.path.normpath(local))
+    return local, dest or "."
+
+
+def _arcname(dest, name):
+    arc = os.path.normpath(os.path.join(dest, name))
+    if os.path.isabs(dest) or arc == ".." or arc.startswith(".." + os.sep):
+        raise RuntimeError(f"--path destination escapes the project dir: {dest}")
+    return arc
+
+
+def _overlay(members, spec):
+    local, dest = _split_path_spec(spec)
+    if not os.path.isdir(local):
+        members[_arcname(dest, os.path.basename(local))] = local
+        return
+    for root, _, names in os.walk(local):
+        for n in names:
+            p = os.path.join(root, n)
+            members[_arcname(dest, os.path.relpath(p, local))] = p
+
+
+def bundle(src, out, paths=()):
+    tracked = remote.git_files(src)
+    if tracked is None:
+        raise RuntimeError(f"bundle: {src} is not a git repository")
+    if not tracked:
+        raise RuntimeError(f"bundle: no files to ship from {src}")
+    members = {f: os.path.join(src, f) for f in tracked}
+    for spec in paths or []:
+        _overlay(members, spec)
+    if out == "-":
+        _write_bundle(sys.stdout.buffer, members)
     else:
-        dest = dest or "."
-    if not dest.startswith("/"):
-        dest = f"{REMOTE_DIR}/{dest}"
-    remote.put(inst, local, dest)
+        with open(out, "wb") as fh:
+            _write_bundle(fh, members)
+    return len(members)
+
+
+def _write_bundle(stream, members):
+    with tarfile.open(fileobj=stream, mode="w:gz") as tar:
+        for arc, local in sorted(members.items()):
+            tar.add(local, arcname=f"./{arc}", recursive=False)
 
 
 def destroy_with_retries(inst_id, attempts=5, backoff=3):
@@ -200,14 +247,18 @@ def _provision_reachable(filters, options, label, log, pubkey, on_account, attem
     raise RuntimeError("no reachable node within attempt budget")
 
 
-def _push_and_start(inst, local_dir, cmd, job, setup, paths, log):
+def _push_and_start(inst, src, cmd, job, setup, paths, log, bundle=None):
     log("writing JOB marker...")
     _write_job(inst, job)
-    log("pushing project files...")
-    push_dir(inst, local_dir)
-    for spec in paths or []:
-        log(f"pushing {spec}")
-        push_path(inst, spec)
+    if bundle:
+        log(f"pushing bundle {bundle}...")
+        remote.put_bundle(inst, bundle, REMOTE_DIR)
+    else:
+        log("pushing project files...")
+        push_dir(inst, src)
+        for spec in paths or []:
+            log(f"pushing {spec}")
+            push_path(inst, spec)
     if setup:
         log("running setup...")
         rc = remote.shell(inst, f"cd {REMOTE_DIR} && {setup}")
@@ -245,11 +296,11 @@ def launch(
     drain=1800,
     paths=None,
     attach_missing_key=False,
+    bundle=None,
 ):
     def log(m):
         logger.info("[launch:%s] %s", label, m)
 
-    local_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
     job = {
         "label": label,
         "cmd": cmd,
@@ -277,7 +328,7 @@ def launch(
     )
     try:
         log("ssh up")
-        _push_and_start(inst, local_dir, cmd, job, setup, paths, log)
+        _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)
     except (Exception, KeyboardInterrupt) as e:
         log(f"launch aborted ({e!r}); destroying node")
         destroy_with_retries(inst_id)
@@ -306,6 +357,7 @@ def rerun(
     grace=None,
     max_age=None,
     drain=None,
+    bundle=None,
 ):
     def log(m):
         logger.info("[rerun:%s] %s", label, m)
@@ -326,7 +378,6 @@ def rerun(
         raise RuntimeError("node has no JOB marker; use launch instead")
     job = prev["job"]
     cmd = cmd or job["cmd"]
-    local_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
     job = {
         "label": label,
         "cmd": cmd,
@@ -335,8 +386,9 @@ def rerun(
         "max_age_s": max_age if max_age is not None else job["max_age_s"],
         "drain_s": drain if drain is not None else job["drain_s"],
     }
+    _write_job(inst, job)
     _reset_node(inst, log)
-    _push_and_start(inst, local_dir, cmd, job, setup, paths, log)
+    _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)
     log(f"rerunning on {inst['id']} ({inst['ssh']}); cmd: {cmd}")
     return inst["id"]
 

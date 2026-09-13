@@ -670,7 +670,11 @@ def a_dropped_push_is_retried_not_fatal():
         calls.append(dest)
         return (0, 0) if len(calls) > 1 else (2, 255)
 
-    with _patched(remote, _stream_once=flaky), _instant_retries():
+    with (
+        _patched(remote, _stream_once=flaky),
+        _patched(client, get_running_instances=lambda: iter([{"id": 7}])),
+        _instant_retries(),
+    ):
         remote._stream({"id": 7}, ["-C", "/tmp", "."], "/root/proj")
     assert len(calls) == 2, f"one drop must be retried, not fatal: {calls}"
 
@@ -683,14 +687,28 @@ def a_push_that_never_lands_still_fails():
         calls.append(dest)
         return (2, 255)
 
-    with _patched(remote, _stream_once=always_drops), _instant_retries():
-        try:
-            remote._stream({"id": 7}, ["-C", "/tmp", "."], "/root/proj")
-        except RuntimeError as e:
-            assert "ssh=255" in str(e), f"the real rc must survive retries: {e}"
-            assert len(calls) == 5, f"must stop after 5 attempts: {calls}"
-            return
-    raise AssertionError("a push that never lands must raise")
+    with (
+        _patched(remote, _stream_once=always_drops),
+        _patched(client, get_running_instances=lambda: iter([{"id": 7}])),
+        _instant_retries(),
+    ):
+        msg = _raises(
+            RuntimeError, remote._stream, {"id": 7}, ["-C", "/tmp", "."], "/root/proj"
+        )
+    assert "ssh=255" in msg, f"the real rc must survive retries: {msg}"
+    assert len(calls) == 5, f"must stop after 5 attempts: {calls}"
+
+
+@case
+def a_failed_push_bar_does_not_claim_everything_landed():
+    seen = []
+    with _patched(remote, sys=_tty(True)):
+        remote._track(
+            iter([b"./a.bin\n"]),
+            {"a.bin": 300, "sub/b.bin": 700},
+            lambda d, t: seen.append(d),
+        )
+    assert seen == [300], f"the bar must stop at the bytes tar named: {seen}"
 
 
 @case
