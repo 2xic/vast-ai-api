@@ -105,15 +105,17 @@ def ssh_argv(inst, ssh_args=(), direct=False):
 
 
 def shell(inst, cmd, tty=False):
+    if not inst.get("ssh_addr"):
+        run_any(inst, "true", timeout=30)
     cmd_ssh, *rest = base(inst)
     opts = ["-t"] if tty else []
     return subprocess.call([cmd_ssh, *opts, *rest, cmd])
 
 
-def run(inst, cmd, timeout=None):
+def _run_at(argv, cmd, timeout):
     try:
         p = subprocess.run(
-            [*base(inst), cmd],
+            [*argv, cmd],
             capture_output=True,
             text=True,
             check=False,
@@ -122,6 +124,23 @@ def run(inst, cmd, timeout=None):
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
     return p.returncode, p.stdout, p.stderr
+
+
+def run(inst, cmd, timeout=None):
+    return _run_at(base(inst), cmd, timeout)
+
+
+def run_any(inst, cmd, timeout=None):
+    if inst.get("ssh_addr"):
+        return run(inst, cmd, timeout)
+    out = (255, "", f"instance {inst['id']} has no ssh address yet")
+    for host, port in _addr_candidates(inst):
+        inst["ssh_addr"] = (host, port)
+        out = run(inst, cmd, timeout)
+        if out[0] == 0:
+            return out
+    inst.pop("ssh_addr", None)
+    return out
 
 
 def _probe(inst, host, port, timeout=30):

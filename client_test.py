@@ -850,6 +850,53 @@ def a_reachable_direct_ip_is_preferred():
     assert inst["ssh_addr"] == ("1.2.3.4", 40022), f"must not relay: {inst}"
 
 
+def _two_route_node():
+    return {
+        "id": 9,
+        "ssh_host": "ssh8.vast.ai",
+        "ssh_port": 11778,
+        "ssh_direct": {"host": "1.2.3.4", "port": 40022},
+    }
+
+
+def _answers(alive):
+    def fake(argv, cmd, timeout):
+        host = next(a for a in argv if a.startswith("root@"))[len("root@") :]
+        return (0, host, "") if host == alive else (255, "", "refused")
+
+    return fake
+
+
+@case
+def a_status_probe_uses_whichever_route_answers():
+    for alive, want in (("1.2.3.4", 40022), ("ssh8.vast.ai", 11778)):
+        inst = _two_route_node()
+        with _patched(remote, _run_at=_answers(alive)):
+            rc, out, _ = remote.run_any(inst, "true")
+        assert (rc, out) == (0, alive), f"{alive} answered but we reported {rc}"
+        assert inst["ssh_addr"] == (alive, want), f"the live route must stick: {inst}"
+
+
+@case
+def an_interactive_shell_also_follows_the_route_that_answers():
+    inst = _two_route_node()
+    got = []
+    fake = types.SimpleNamespace(call=lambda argv: got.append(argv) or 0)
+    with _patched(remote, _run_at=_answers("1.2.3.4"), subprocess=fake):
+        remote.shell(inst, "true")
+    assert "root@1.2.3.4" in got[0], f"exec must not insist on the proxy: {got}"
+
+
+@case
+def a_probe_that_reaches_nothing_keeps_the_node_addressless():
+    inst = _two_route_node()
+    with _patched(remote, _run_at=_answers("nobody")):
+        rc, _, err = remote.run_any(inst, "true")
+    assert rc == 255, f"a dead node must not report success: {rc}"
+    assert err == "refused", f"the real failure must survive: {err}"
+    assert "ssh_addr" not in inst, f"a dead route must not be cached: {inst}"
+
+
 @case
 def a_node_that_answers_on_neither_address_still_fails():
     inst = {

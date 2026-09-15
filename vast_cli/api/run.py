@@ -413,7 +413,7 @@ PROBE = (
 
 
 def _probe(inst):
-    rc, out, _ = remote.run(inst, PROBE, timeout=45)
+    rc, out, _ = remote.run_any(inst, PROBE, timeout=45)
     if rc != 0:
         return None
     try:
