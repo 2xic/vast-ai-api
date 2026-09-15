@@ -54,6 +54,25 @@ def _add_any_host(p):
     )
 
 
+def _machine_ids(text):
+    out = []
+    for word in text.replace(",", " ").split():
+        if not word.isdigit():
+            raise argparse.ArgumentTypeError(f"not a machine id: {word!r}")
+        out.append(int(word))
+    return tuple(out)
+
+
+def _add_skip_machines(p):
+    p.add_argument(
+        "--skip-machines",
+        type=_machine_ids,
+        default=(),
+        metavar="ID[,ID...]",
+        help="never rent these machine ids",
+    )
+
+
 def _add_bundle_flag(p):
     p.add_argument(
         "--bundle",
@@ -128,6 +147,7 @@ def main():
         help="extra file/dir to push (repeatable); REMOTE relative to the project dir",
     )
     _add_any_host(launch_p)
+    _add_skip_machines(launch_p)
 
     b = sub.add_parser(
         "bundle",
@@ -265,6 +285,7 @@ def _do_launch(args):
         mbps_down=args.down,
         gpu_name=args.gpu,
         verified=not args.any_host,
+        skip_machines=args.skip_machines,
     )
     options = InstanceOptions()
     options.disk_space = args.disk

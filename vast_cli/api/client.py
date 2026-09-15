@@ -64,6 +64,7 @@ class AvailableInstancesFilter:
     mbps_down: float = 10
     gpu_name: str = None
     verified: bool = True
+    skip_machines: tuple = ()
 
 
 OFFER_LIMIT = 64
@@ -110,7 +111,11 @@ def get_available_instances(
     results = _request("GET", wrap_url(f"{api_url}/bundles/", {"q": search}))
     if "offers" not in results:
         raise RuntimeError(f"bundles search returned no 'offers': {results}")
+    skip = set(options.skip_machines)
     for i in results["offers"]:
+        if i["machine_id"] in skip:
+            logger.info("[offers] skipping machine %s", i["machine_id"])
+            continue
         yield _offer(i)
 
 

@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # ///
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -126,6 +127,15 @@ def a_search_never_asks_for_more_than_the_server_returns():
     with _patched(client, _request=fake):
         list(client.get_available_instances(_FILTER_4090, limit=5000))
     assert asked[0]["limit"] == 64, f"the server caps a page at 64: {asked[0]['limit']}"
+
+
+@case
+def a_named_bad_machine_is_never_offered():
+    fake, _ = _market([_raw_offer(1), _raw_offer(2)])
+    filters = dataclasses.replace(_FILTER_4090, skip_machines=(2,))
+    with _patched(client, _request=fake):
+        got = [o["machine_id"] for o in client.get_available_instances(filters)]
+    assert got == [1], f"a skipped machine must not be rentable: {got}"
 
 
 @case
@@ -285,6 +295,14 @@ def launch_and_gpus_agree_on_which_hosts_count():
     assert not _launch_filter([*base, "--any-host"]).verified, (
         "a price gpus --any-host quotes must be one launch can rent at"
     )
+
+
+@case
+def the_skip_machines_list_reaches_the_offer_filter():
+    base = ["vast", "launch", "/tmp", "--cmd", "x"]
+    assert _launch_filter(base).skip_machines == (), "nothing is skipped by default"
+    got = _launch_filter([*base, "--skip-machines", "7,9"])
+    assert got.skip_machines == (7, 9), f"every id must reach the search: {got}"
 
 
 @case
