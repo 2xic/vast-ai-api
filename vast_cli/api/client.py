@@ -260,6 +260,7 @@ def _instance_row(instance):
     ports = instance.get("ports") or {}
     return {
         "id": instance["id"],
+        "machine_id": instance.get("machine_id"),
         "ssh_host": host,
         "ssh_port": port,
         "ssh_direct": _direct_ssh(public_ip, ports),

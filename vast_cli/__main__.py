@@ -35,12 +35,12 @@ def _print_ps(rows):
     lw = max([len("LABEL"), *(len(r["label"]) for r in rows)])
     sw = max([len("STATE"), *(len(s) for s in states)])
     print(
-        f"{'ID':>10}  {'LABEL':<{lw}} {'STATE':<{sw}} "
+        f"{'ID':>10}  {'MACHINE':>8}  {'LABEL':<{lw}} {'STATE':<{sw}} "
         f"{'AGE':<10} {'LEFT':<10} {'GPU%':<8} RESTARTS"
     )
     for r, state in zip(rows, states, strict=True):
         print(
-            f"{r['id']:>10}  {r['label']:<{lw}} {state:<{sw}} "
+            f"{r['id']:>10}  {r['machine_id']:>8}  {r['label']:<{lw}} {state:<{sw}} "
             f"{_fmt_dur(r['age_s']):<10} {_fmt_dur(r['left_s']):<10} "
             f"{r['gpu']:<8} {r['restarts']}"
         )

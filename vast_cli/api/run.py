@@ -717,6 +717,7 @@ def ps():
         rows.append(
             {
                 "id": inst["id"],
+                "machine_id": inst.get("machine_id") or "-",
                 "label": (inst.get("label") or "")[len(LABEL_PREFIX) :],
                 "state": _state(p),
                 "done": p["done"] if p else "-",

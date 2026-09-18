@@ -133,8 +133,10 @@ def run(inst, cmd, timeout=None):
 def run_any(inst, cmd, timeout=None):
     if inst.get("ssh_addr"):
         return run(inst, cmd, timeout)
-    out = (255, "", f"instance {inst['id']} has no ssh address yet")
-    for host, port in _addr_candidates(inst):
+    candidates = _addr_candidates(inst)
+    if not candidates:
+        return run(inst, cmd, timeout)
+    for host, port in candidates:
         inst["ssh_addr"] = (host, port)
         out = run(inst, cmd, timeout)
         if out[0] == 0:

@@ -862,7 +862,7 @@ def _two_route_node():
 def _answers(alive):
     def fake(argv, cmd, timeout):
         host = next(a for a in argv if a.startswith("root@"))[len("root@") :]
-        return (0, host, "") if host == alive else (255, "", "refused")
+        return (0, host, "") if host == alive else (255, "", f"refused by {host}")
 
     return fake
 
@@ -893,8 +893,19 @@ def a_probe_that_reaches_nothing_keeps_the_node_addressless():
     with _patched(remote, _run_at=_answers("nobody")):
         rc, _, err = remote.run_any(inst, "true")
     assert rc == 255, f"a dead node must not report success: {rc}"
-    assert err == "refused", f"the real failure must survive: {err}"
+    assert err == "refused by ssh8.vast.ai", f"the real failure must survive: {err}"
     assert "ssh_addr" not in inst, f"a dead route must not be cached: {inst}"
+
+
+@case
+def a_node_with_no_address_at_all_raises_instead_of_looking_unreachable():
+    inst = {"id": 9, "ssh_host": None, "ssh_port": None, "ssh_direct": None}
+    try:
+        remote.run_any(inst, "true")
+    except RuntimeError as e:
+        assert "no ssh address" in str(e), f"wrong error: {e}"
+        return
+    raise AssertionError("a missing address must raise, not report unreachable")
 
 
 @case
