@@ -146,6 +146,11 @@ def main():
         metavar="LOCAL[:REMOTE]",
         help="extra file/dir to push (repeatable); REMOTE relative to the project dir",
     )
+    launch_p.add_argument(
+        "--node-key",
+        action="store_true",
+        help="attach the ssh key to this node only, not to your vast account",
+    )
     _add_any_host(launch_p)
     _add_skip_machines(launch_p)
 
@@ -298,8 +303,9 @@ def _do_launch(args):
     pubkey = run.local_pubkey()
     if not run.key_on_account(pubkey):
         print(f"this ssh key is NOT on your vast account:\n  {pubkey}")
-        if not _confirm("attach it so the node is reachable? [y/N] "):
-            sys.exit("aborted: no ssh key attached, the node would be unreachable")
+        where = "this node only" if args.node_key else "your vast account"
+        if not _confirm(f"add it to {where}? [y/N] "):
+            sys.exit("aborted: no ssh key added, the node would be unreachable")
         attach = True
     run.launch(
         args.src,
@@ -313,6 +319,7 @@ def _do_launch(args):
         drain=args.drain,
         paths=args.path,
         attach_missing_key=attach,
+        node_key_only=args.node_key,
         bundle=args.bundle,
     )
 

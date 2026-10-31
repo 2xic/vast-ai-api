@@ -12,6 +12,7 @@ from vast_cli.api import remote
 from vast_cli.api.client import (
     AvailableInstancesFilter,
     InstanceOptions,
+    add_account_ssh_key,
     attach_ssh_key,
     create_instance,
     delete_instance,
@@ -211,7 +212,7 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=())
     raise RuntimeError("no available offer could be rented (all matches taken)")
 
 
-def _provision_reachable(filters, options, label, log, pubkey, on_account, attempts=3):
+def _provision_reachable(filters, options, label, log, node_key=None, attempts=3):
     bad_machines = set()
     last_failure = None
     for attempt in range(1, attempts + 1):
@@ -225,9 +226,9 @@ def _provision_reachable(filters, options, label, log, pubkey, on_account, attem
             log(f"no offer left outside the {len(bad_machines)} machines that failed")
             raise last_failure from e
         try:
-            if not on_account:
-                attach_ssh_key(inst_id, pubkey)
-                log(f"ssh key attached to {inst_id}")
+            if node_key:
+                attach_ssh_key(inst_id, node_key)
+                log(f"ssh key attached to {inst_id} only")
             log(f"created {inst_id}, waiting for ssh...")
             inst = wait_until_ready(inst_id, log=log)
             remote.wait(inst, log=log)
@@ -297,6 +298,7 @@ def launch(
     paths=None,
     attach_missing_key=False,
     bundle=None,
+    node_key_only=False,
 ):
     def log(m):
         logger.info("[launch:%s] %s", label, m)
@@ -318,14 +320,19 @@ def launch(
         )
     pubkey = local_pubkey()
     on_account = key_on_account(pubkey)
-    if not on_account and not attach_missing_key:
-        raise RuntimeError(
-            f"ssh key not on vast account ({pubkey}); pass attach_missing_key=True "
-            f"to attach it, else the node would be unreachable"
-        )
-    inst_id, inst = _provision_reachable(
-        filters, options, label, log, pubkey, on_account
-    )
+    node_key = None
+    if not on_account:
+        if not attach_missing_key:
+            raise RuntimeError(
+                f"ssh key not on vast account ({pubkey}); pass attach_missing_key=True "
+                f"to add it, else the node would be unreachable"
+            )
+        if node_key_only:
+            node_key = pubkey
+        else:
+            add_account_ssh_key(pubkey)
+            log("ssh key added to the vast account")
+    inst_id, inst = _provision_reachable(filters, options, label, log, node_key)
     try:
         log("ssh up")
         _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)

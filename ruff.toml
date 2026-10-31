@@ -2,7 +2,7 @@ line-length = 88
 
 [lint]
 select = ["E", "F", "W", "B", "SIM", "UP", "RUF", "I", "PL"]
-ignore = ["PLR0911", "PLR0913", "PLR0915"]
+ignore = ["PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917"]
 
 [lint.per-file-ignores]
 "bash_test.py" = ["E402", "PLR2004"]

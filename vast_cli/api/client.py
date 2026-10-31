@@ -166,6 +166,11 @@ def attach_ssh_key(instance_id, public_key):
     return _api("POST", url, "attach_ssh_key", json={"ssh_key": public_key})
 
 
+def add_account_ssh_key(public_key):
+    url = wrap_url(f"{api_url}/ssh/")
+    return _api("POST", url, "add_account_ssh_key", json={"ssh_key": public_key})
+
+
 def _is_ready(inst):
     return bool(
         inst and inst["status"] == "running" and inst["ssh_host"] and inst["ssh_port"]

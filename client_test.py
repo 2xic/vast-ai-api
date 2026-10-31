@@ -927,6 +927,73 @@ def a_node_that_answers_on_neither_address_still_fails():
 
 
 @case
+def a_missing_key_goes_on_the_account_before_the_node_is_rented():
+    order = []
+    patches = dict(
+        _find_existing=lambda label: [],
+        local_pubkey=lambda: "ssh-ed25519 AAAA me@host",
+        key_on_account=lambda k: False,
+        add_account_ssh_key=lambda k: order.append(("account", k)),
+        _provision_reachable=lambda *a, **k: (
+            order.append(("rent", None)),
+            (5, {"id": 5, "ssh": "ssh://x"}),
+        )[1],
+        _push_and_start=lambda *a, **k: None,
+    )
+    with _patched(run, **patches):
+        run.launch("/tmp", "c", None, None, "job", attach_missing_key=True)
+    assert order == [("account", "ssh-ed25519 AAAA me@host"), ("rent", None)], (
+        f"the key must reach the account before the rent, got {order}"
+    )
+
+
+@case
+def node_key_only_attaches_to_the_node_and_leaves_the_account_alone():
+    attached = []
+    patches = dict(
+        _find_existing=lambda label: [],
+        local_pubkey=lambda: "k",
+        key_on_account=lambda k: False,
+        add_account_ssh_key=lambda k: (_ for _ in ()).throw(
+            AssertionError("--node-key must not write to the account")
+        ),
+        get_available_instances=lambda f: iter(
+            [{"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1}]
+        ),
+        create_instance=lambda oid, o, label=None: 5,
+        attach_ssh_key=lambda inst_id, key: attached.append((inst_id, key)),
+        wait_until_ready=lambda inst_id, log=None: {"id": 5, "ssh": "ssh://x"},
+        _push_and_start=lambda *a, **k: None,
+    )
+    with (
+        _patched(run, **patches),
+        _patched(run.remote, wait=lambda inst, log=None: None),
+    ):
+        run.launch(
+            "/tmp", "c", None, None, "job", attach_missing_key=True, node_key_only=True
+        )
+    assert attached == [(5, "k")], f"the key must reach only the node, got {attached}"
+
+
+@case
+def launching_without_consent_refuses_instead_of_renting_an_unreachable_node():
+    patches = dict(
+        _find_existing=lambda label: [],
+        local_pubkey=lambda: "k",
+        key_on_account=lambda k: False,
+        add_account_ssh_key=lambda k: (_ for _ in ()).throw(
+            AssertionError("no consent, no account write")
+        ),
+        _provision_reachable=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("nothing may be rented")
+        ),
+    )
+    with _patched(run, **patches):
+        msg = _raises(RuntimeError, run.launch, "/tmp", "c", None, None, "job")
+    assert "not on vast account" in msg, f"the reason must be clear: {msg}"
+
+
+@case
 def a_broken_machine_is_not_rented_again():
     offers = [
         {"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1},
@@ -940,12 +1007,11 @@ def a_broken_machine_is_not_rented_again():
     patches = dict(
         get_available_instances=lambda f: iter(offers),
         create_instance=lambda oid, o, label=None: (rented.append(oid), oid)[1],
-        attach_ssh_key=lambda *a, **k: None,
         destroy_with_retries=lambda *a, **k: True,
         wait_until_ready=always_broken,
     )
     with _patched(run, **patches), contextlib.suppress(client.InstanceError):
-        run._provision_reachable(None, None, "l", lambda m: None, "k", True, attempts=2)
+        run._provision_reachable(None, None, "l", lambda m: None, attempts=2)
     assert rented == [1, 2], f"attempt 2 must skip the failed machine: {rented}"
 
 
@@ -959,15 +1025,12 @@ def exhausting_the_offers_reports_why_the_nodes_failed():
     patches = dict(
         get_available_instances=lambda f: iter(offers),
         create_instance=lambda oid, o, label=None: oid,
-        attach_ssh_key=lambda *a, **k: None,
         destroy_with_retries=lambda *a, **k: True,
         wait_until_ready=always_broken,
     )
     with _patched(run, **patches):
         try:
-            run._provision_reachable(
-                None, None, "l", lambda m: None, "k", True, attempts=3
-            )
+            run._provision_reachable(None, None, "l", lambda m: None, attempts=3)
         except client.InstanceError as e:
             assert "EOF" in str(e), f"the real cause must survive: {e}"
             return
