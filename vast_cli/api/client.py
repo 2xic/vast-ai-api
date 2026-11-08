@@ -54,6 +54,25 @@ def _api(method, url, what, **kwargs):
     return body
 
 
+EUROPE = (
+    "NO", "SE", "DK", "FI", "IS", "EE", "LV", "LT", "IE", "GB", "NL", "BE",
+    "LU", "DE", "FR", "CH", "AT", "ES", "PT", "IT", "CZ", "SK", "PL", "HU",
+    "SI", "HR", "RO", "BG", "GR", "UA", "MD", "RS", "TR",
+)
+COUNTRY_GROUPS = {
+    "EUROPE": EUROPE,
+    "EU": EUROPE,
+    "NORDICS": ("NO", "SE", "DK", "FI", "IS"),
+}
+
+
+def countries(text):
+    out = []
+    for token in text.replace(",", " ").split():
+        out.extend(COUNTRY_GROUPS.get(token.upper(), (token.upper(),)))
+    return tuple(dict.fromkeys(out))
+
+
 @dataclass
 class AvailableInstancesFilter:
     min_gpu: int = 8
@@ -65,6 +84,9 @@ class AvailableInstancesFilter:
     gpu_name: str = None
     verified: bool = True
     skip_machines: tuple = ()
+    countries: tuple = ()
+    direct_port: bool = False
+    min_reliability: float = 0.0
 
 
 OFFER_LIMIT = 64
@@ -108,6 +130,12 @@ def get_available_instances(
         search["verified"] = {"eq": True}
     if options.gpu_name:
         search["gpu_name"] = {"eq": options.gpu_name}
+    if options.countries:
+        search["geolocation"] = {"in": list(options.countries)}
+    if options.direct_port:
+        search["direct_port_count"] = {"gte": 1}
+    if options.min_reliability:
+        search["reliability2"] = {"gte": options.min_reliability}
     results = _request("GET", wrap_url(f"{api_url}/bundles/", {"q": search}))
     if "offers" not in results:
         raise RuntimeError(f"bundles search returned no 'offers': {results}")

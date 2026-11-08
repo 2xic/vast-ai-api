@@ -4,7 +4,7 @@ import os
 import shlex
 import sys
 
-from vast_cli.api import AvailableInstancesFilter, InstanceOptions, run
+from vast_cli.api import AvailableInstancesFilter, InstanceOptions, client, run
 
 
 def _fmt_dur(s):
@@ -70,6 +70,29 @@ def _add_skip_machines(p):
         default=(),
         metavar="ID[,ID...]",
         help="never rent these machine ids",
+    )
+
+
+def _add_offer_filters(p):
+    p.add_argument(
+        "--countries",
+        type=client.countries,
+        default=(),
+        metavar="CC[,CC...]",
+        help="only rent in these countries, e.g. 'no,se', or a group: "
+        + ", ".join(sorted(k.lower() for k in client.COUNTRY_GROUPS)),
+    )
+    p.add_argument(
+        "--direct-port",
+        action="store_true",
+        help="only rent nodes with a direct ssh port, skipping the vast ssh proxy",
+    )
+    p.add_argument(
+        "--min-reliability",
+        type=float,
+        default=0.0,
+        metavar="FRAC",
+        help="minimum host reliability score, e.g. 0.98",
     )
 
 
@@ -153,6 +176,7 @@ def main():
     )
     _add_any_host(launch_p)
     _add_skip_machines(launch_p)
+    _add_offer_filters(launch_p)
 
     b = sub.add_parser(
         "bundle",
@@ -291,6 +315,9 @@ def _do_launch(args):
         gpu_name=args.gpu,
         verified=not args.any_host,
         skip_machines=args.skip_machines,
+        countries=args.countries,
+        direct_port=args.direct_port,
+        min_reliability=args.min_reliability,
     )
     options = InstanceOptions()
     options.disk_space = args.disk

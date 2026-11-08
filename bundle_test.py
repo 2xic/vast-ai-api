@@ -374,6 +374,46 @@ def put_bundle_rejects_a_missing_tarball():
     assert "not found" in msg, msg
 
 
+@test
+def vastignore_filters_tracked_files_and_overlays_from_the_src_dir():
+    with tempfile.TemporaryDirectory() as d:
+        src = f"{d}/proj"
+        _repo(src)
+        _write(f"{src}/.vastignore", "plots\n*.log\n__pycache__\nextra/build\n")
+        _write(f"{src}/train.py", "x")
+        _write(f"{src}/plots/a/b.png", "p")
+        _write(f"{src}/run.log", "l")
+        _git(src, "add", "-Af")
+        _write(f"{d}/extra/keep.py", "k")
+        _write(f"{d}/extra/build/lib.py", "b")
+        _write(f"{d}/extra/__pycache__/x.pyc", "c")
+        out = f"{d}/j.tgz"
+        cwd = os.getcwd()
+        os.chdir(tempfile.gettempdir())
+        try:
+            _bundle(src, out, (f"{d}/extra:extra",))
+        finally:
+            os.chdir(cwd)
+        got = set(_members(out))
+    assert got == {".vastignore", "train.py", "extra/keep.py"}, got
+
+
+@test
+def a_slash_pattern_filters_the_same_overlay_file_in_both_push_paths():
+    with tempfile.TemporaryDirectory() as d:
+        _write(f"{d}/proj/.vastignore", "extra/build\n")
+        _write(f"{d}/extra/build/lib.py", "b")
+        _write(f"{d}/extra/keep.py", "k")
+        pushed = {}
+        real_put = remote.put
+        remote.put = lambda inst, local, dest, files=None: pushed.update(files=files)
+        try:
+            run.push_path(NODE, f"{d}/proj", f"{d}/extra:extra")
+        finally:
+            remote.put = real_put
+    assert pushed["files"] == ["keep.py"], pushed
+
+
 def main():
     if sys.argv[1:2] == ["--emit"]:
         run.bundle(sys.argv[2], "-")

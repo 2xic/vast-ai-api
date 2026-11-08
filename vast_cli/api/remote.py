@@ -1,3 +1,5 @@
+import fnmatch
+import functools
 import hashlib
 import logging
 import os
@@ -8,6 +10,30 @@ import tempfile
 import time
 
 logger = logging.getLogger("vast_cli")
+
+IGNORE_FILE = os.environ.get("VAST_IGNORE_FILE", ".vastignore")
+
+
+@functools.cache
+def push_excludes(root="."):
+    pats = os.environ.get("VAST_PUSH_EXCLUDE", "").split(",")
+    try:
+        with open(os.path.join(root, IGNORE_FILE)) as fh:
+            pats += [line.partition("#")[0] for line in fh]
+    except OSError:
+        pass
+    return tuple(p.strip().rstrip("/") for p in pats if p.strip().rstrip("/"))
+
+
+def excluded(name, root="."):
+    parts = name.split("/")
+    prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+    for pat in push_excludes(root):
+        targets = prefixes if "/" in pat else parts
+        if any(fnmatch.fnmatch(t, pat) for t in targets):
+            return True
+    return False
+
 
 SSH_OPTS = [
     "-o",
@@ -81,13 +107,13 @@ def _mux_opts(inst, host, port):
     ]
 
 
-def _argv(inst, host, port, ssh_args=()):
+def _argv(inst, host, port, ssh_args=(), mux=True):
     if not host or not port:
         raise RuntimeError(f"instance {inst['id']} has no ssh address yet")
     return [
         "ssh",
         *SSH_OPTS,
-        *_mux_opts(inst, host, port),
+        *(_mux_opts(inst, host, port) if mux else ["-o", "ControlPath=none"]),
         "-p",
         str(port),
         f"root@{host}",
@@ -95,9 +121,9 @@ def _argv(inst, host, port, ssh_args=()):
     ]
 
 
-def base(inst):
+def base(inst, mux=True):
     host, port = inst.get("ssh_addr") or addr(inst)
-    return _argv(inst, host, port)
+    return _argv(inst, host, port, mux=mux)
 
 
 def ssh_argv(inst, ssh_args=(), direct=False):
@@ -208,7 +234,7 @@ def _stream_once(inst, tar_src, dest, sizes=None):
         stderr=subprocess.PIPE if sizes else None,
     )
     try:
-        ssh = subprocess.Popen([*base(inst), unpack], stdin=tar.stdout)
+        ssh = subprocess.Popen([*base(inst, mux=False), unpack], stdin=tar.stdout)
     finally:
         tar.stdout.close()
     if sizes:
@@ -267,7 +293,7 @@ def put_bundle(inst, tarball, dest, *, attempts=5, backoff=5):
     unpack = f"mkdir -p {q} && tar xzf - -C {q}"
     for attempt in range(1, attempts + 1):
         with open(tarball, "rb") as fh:
-            rc = subprocess.call([*base(inst), unpack], stdin=fh)
+            rc = subprocess.call([*base(inst, mux=False), unpack], stdin=fh)
         if rc == 0:
             return
         if attempt == attempts:
@@ -282,6 +308,7 @@ def put(inst, local, dest, files=None):
     if not os.path.exists(local):
         raise RuntimeError(f"put: {local} not found")
     if files is not None:
+        files = [f for f in files if not excluded(f)]
         if not files:
             return
         src = ["-C", local, "--", *files]

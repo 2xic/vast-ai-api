@@ -107,11 +107,19 @@ def push_dir(inst, src):
     remote.put(inst, local, REMOTE_DIR, files=remote.git_files(local))
 
 
-def push_path(inst, spec):
+def push_path(inst, src, spec):
     local, dest = _split_path_spec(spec)
+    files = None
+    if os.path.isdir(local):
+        files = []
+        for root, _, names in os.walk(local):
+            for n in names:
+                rel = os.path.relpath(os.path.join(root, n), local)
+                if not remote.excluded(_arcname(dest, rel), src):
+                    files.append(rel)
     if not dest.startswith("/"):
         dest = f"{REMOTE_DIR}/{dest}"
-    remote.put(inst, local, dest)
+    remote.put(inst, local, dest, files=files)
 
 
 def _split_path_spec(spec):
@@ -131,7 +139,7 @@ def _arcname(dest, name):
     return arc
 
 
-def _overlay(members, spec):
+def _overlay(members, src, spec):
     local, dest = _split_path_spec(spec)
     if not os.path.isdir(local):
         members[_arcname(dest, os.path.basename(local))] = local
@@ -139,7 +147,10 @@ def _overlay(members, spec):
     for root, _, names in os.walk(local):
         for n in names:
             p = os.path.join(root, n)
-            members[_arcname(dest, os.path.relpath(p, local))] = p
+            arc = _arcname(dest, os.path.relpath(p, local))
+            if remote.excluded(arc, src):
+                continue
+            members[arc] = p
 
 
 def bundle(src, out, paths=()):
@@ -148,9 +159,9 @@ def bundle(src, out, paths=()):
         raise RuntimeError(f"bundle: {src} is not a git repository")
     if not tracked:
         raise RuntimeError(f"bundle: no files to ship from {src}")
-    members = {f: os.path.join(src, f) for f in tracked}
+    members = {f: os.path.join(src, f) for f in tracked if not remote.excluded(f, src)}
     for spec in paths or []:
-        _overlay(members, spec)
+        _overlay(members, src, spec)
     if out == "-":
         _write_bundle(sys.stdout.buffer, members)
     else:
@@ -259,7 +270,7 @@ def _push_and_start(inst, src, cmd, job, setup, paths, log, bundle=None):
         push_dir(inst, src)
         for spec in paths or []:
             log(f"pushing {spec}")
-            push_path(inst, spec)
+            push_path(inst, src, spec)
     if setup:
         log("running setup...")
         rc = remote.shell(inst, f"cd {REMOTE_DIR} && {setup}")

@@ -352,7 +352,7 @@ def a_receiver_that_dies_mid_push_does_not_hang():
         raise AssertionError("push hung: tar is blocked on a pipe nobody reads")
 
     real_base = remote.base
-    remote.base = lambda inst: ["sh", "-c", "exit 1"]
+    remote.base = lambda inst, mux=True: ["sh", "-c", "exit 1"]
     signal.signal(signal.SIGALRM, hung)
     signal.alarm(20)
     try:
