@@ -203,6 +203,29 @@ def destroy_with_retries(inst_id, attempts=5, backoff=3):
     return False
 
 
+SKIP_CACHE = os.path.expanduser(
+    os.environ.get("VAST_SKIP_CACHE", "~/.cache/vast/bad_machines.jsonl")
+)
+SKIP_TTL = 86400
+
+
+def bad_machine_cache(add=None, ttl=SKIP_TTL):
+    now = int(time.time())
+    rows = []
+    try:
+        with open(SKIP_CACHE) as fh:
+            rows = [json.loads(line) for line in fh if line.strip()]
+    except (OSError, ValueError):
+        pass
+    rows = [r for r in rows if now - r["ts"] < ttl and r["machine_id"] != add]
+    if add is not None:
+        rows.append({"machine_id": add, "ts": now})
+        os.makedirs(os.path.dirname(SKIP_CACHE), exist_ok=True)
+        with open(SKIP_CACHE, "w") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in rows)
+    return {r["machine_id"] for r in rows}
+
+
 def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=()):
     for offer in get_available_instances(filters):
         if offer["machine_id"] in skip:
@@ -223,8 +246,12 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=())
     raise RuntimeError("no available offer could be rented (all matches taken)")
 
 
-def _provision_reachable(filters, options, label, log, node_key=None, attempts=3):
-    bad_machines = set()
+def _provision_reachable(
+    filters, options, label, log, node_key=None, attempts=3, then=None
+):
+    bad_machines = bad_machine_cache()
+    if bad_machines:
+        log(f"skipping {len(bad_machines)} machines that failed in the last 24h")
     last_failure = None
     for attempt in range(1, attempts + 1):
         try:
@@ -243,15 +270,19 @@ def _provision_reachable(filters, options, label, log, node_key=None, attempts=3
             log(f"created {inst_id}, waiting for ssh...")
             inst = wait_until_ready(inst_id, log=log)
             remote.wait(inst, log=log)
+            log("ssh up")
+            if then:
+                then(inst)
             return inst_id, inst
         except KeyboardInterrupt:
             log(f"interrupted; destroying {inst_id}")
             destroy_with_retries(inst_id)
             raise
         except Exception as e:
-            log(f"node {inst_id} unreachable ({e!r}); destroying")
+            log(f"node {inst_id} on machine {machine_id} failed ({e!r}); destroying")
             last_failure = e
             bad_machines.add(machine_id)
+            bad_machine_cache(add=machine_id)
             destroy_with_retries(inst_id)
             if attempt == attempts:
                 raise
@@ -343,14 +374,16 @@ def launch(
         else:
             add_account_ssh_key(pubkey)
             log("ssh key added to the vast account")
-    inst_id, inst = _provision_reachable(filters, options, label, log, node_key)
-    try:
-        log("ssh up")
-        _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)
-    except (Exception, KeyboardInterrupt) as e:
-        log(f"launch aborted ({e!r}); destroying node")
-        destroy_with_retries(inst_id)
-        raise
+    inst_id, inst = _provision_reachable(
+        filters,
+        options,
+        label,
+        log,
+        node_key,
+        then=lambda node: _push_and_start(
+            node, src, cmd, job, setup, paths, log, bundle
+        ),
+    )
     log(f"job running on {inst_id} ({inst['ssh']}); the reaper owns teardown now")
     return inst_id
 

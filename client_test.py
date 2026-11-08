@@ -73,6 +73,10 @@ def _patched(mod, **attrs):
             setattr(mod, k, v)
 
 
+def _fresh_cache():
+    return os.path.join(tempfile.mkdtemp(), "bad.jsonl")
+
+
 def case(fn):
     CASES.append(fn)
     return fn
@@ -579,6 +583,7 @@ def an_html_error_page_names_the_status_not_the_json_parser():
 
 def _launch_that_fails(boom=None):
     destroyed = []
+    offers = [{"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1}]
 
     def default_boom(*a, **k):
         raise RuntimeError("setup failed (rc=1)")
@@ -586,13 +591,17 @@ def _launch_that_fails(boom=None):
     with (
         _patched(
             run,
+            SKIP_CACHE=_fresh_cache(),
             _find_existing=lambda label: [],
             local_pubkey=lambda: "k",
             key_on_account=lambda k: True,
-            _provision_reachable=lambda *a, **k: (5, {"id": 5, "ssh": "ssh://x"}),
+            get_available_instances=lambda f: iter(offers),
+            create_instance=lambda oid, o, label=None: 5,
+            wait_until_ready=lambda i, log=None: {"id": 5, "ssh": "ssh://x"},
             _push_and_start=boom or default_boom,
             destroy_with_retries=destroyed.append,
         ),
+        _patched(run.remote, wait=lambda inst, log=None: None),
         contextlib.suppress(RuntimeError, KeyboardInterrupt),
     ):
         run.launch("/tmp", "c", None, None, "job")
@@ -1009,6 +1018,7 @@ def a_broken_machine_is_not_rented_again():
         create_instance=lambda oid, o, label=None: (rented.append(oid), oid)[1],
         destroy_with_retries=lambda *a, **k: True,
         wait_until_ready=always_broken,
+        SKIP_CACHE=_fresh_cache(),
     )
     with _patched(run, **patches), contextlib.suppress(client.InstanceError):
         run._provision_reachable(None, None, "l", lambda m: None, attempts=2)
@@ -1027,6 +1037,7 @@ def exhausting_the_offers_reports_why_the_nodes_failed():
         create_instance=lambda oid, o, label=None: oid,
         destroy_with_retries=lambda *a, **k: True,
         wait_until_ready=always_broken,
+        SKIP_CACHE=_fresh_cache(),
     )
     with _patched(run, **patches):
         try:
@@ -1037,6 +1048,45 @@ def exhausting_the_offers_reports_why_the_nodes_failed():
         except RuntimeError as e:
             raise AssertionError(f"pool exhaustion must not hide the cause: {e}") from e
     raise AssertionError("an all-bad pool must raise")
+
+
+@case
+def a_machine_that_failed_is_skipped_until_the_entry_expires():
+    path = _fresh_cache()
+    with _patched(run, SKIP_CACHE=path):
+        run.bad_machine_cache(add=100)
+        run.bad_machine_cache(add=200)
+        assert run.bad_machine_cache() == {100, 200}, "both failures must persist"
+        assert run.bad_machine_cache(ttl=0) == set(), "an expired entry must drop"
+        assert run.bad_machine_cache() == {100, 200}, "a read must not rewrite"
+
+
+@case
+def a_push_failure_tries_the_next_machine():
+    offers = [
+        {"id": 1, "machine_id": 100, "num_gpus": 1, "gpu": "A100", "price": 1},
+        {"id": 2, "machine_id": 200, "num_gpus": 1, "gpu": "A100", "price": 1},
+    ]
+    started = []
+
+    def boom_once(inst):
+        started.append(inst["id"])
+        if len(started) == 1:
+            raise RuntimeError("setup failed (rc=1)")
+
+    patches = dict(
+        SKIP_CACHE=_fresh_cache(),
+        get_available_instances=lambda f: iter(offers),
+        create_instance=lambda oid, o, label=None: oid,
+        destroy_with_retries=lambda *a, **k: True,
+        wait_until_ready=lambda i, log=None: {"id": i, "ssh": "ssh://x"},
+    )
+    with _patched(run, **patches), _patched(run.remote, wait=lambda i, log=None: None):
+        inst_id, _ = run._provision_reachable(
+            None, None, "l", lambda m: None, attempts=2, then=boom_once
+        )
+    assert started == [1, 2], f"a push failure must move on: {started}"
+    assert inst_id == 2, f"the second machine must win: {inst_id}"
 
 
 @case
