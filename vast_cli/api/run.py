@@ -26,7 +26,15 @@ from vast_cli.api.client import (
 REMOTE_DIR = "/root/proj"
 LABEL_PREFIX = "vrun:"
 LAUNCH_GRACE_S = 1800
+DEFAULT_MAX_AGE_S = 86400
+BACKSTOP_SLACK_S = 3600
+SUPERVISED_FRESH_S = 300
 HEARTBEAT_STALE_S = 90
+RECYCLE_EXIT = "75"
+MAX_RECYCLES = 3
+SUPERVISE_POLL_S = int(os.environ.get("VAST_SUPERVISE_POLL_S", "20"))
+SSH_LOST_S = 600
+LOG_CHUNK = 1048576
 
 logger = logging.getLogger("vast_cli")
 
@@ -39,10 +47,11 @@ JOB_SH = (
     "HB=$!\n"
     "trap true TERM\n"
     "[ -f .env ] && . ./.env\n"
+    f"export VAST_RECYCLE_EXIT={RECYCLE_EXIT}\n"
     "sh run.sh > run.log 2>&1\n"
     "rc=$?\n"
     'kill -KILL "$HB" 2>/dev/null\n'
-    "echo $rc > DONE\n"
+    "echo $rc > EXIT_CODE\n"
 )
 
 
@@ -206,7 +215,7 @@ def destroy_with_retries(inst_id, attempts=5, backoff=3):
 SKIP_CACHE = os.path.expanduser(
     os.environ.get("VAST_SKIP_CACHE", "~/.cache/vast/bad_machines.jsonl")
 )
-SKIP_TTL = 86400
+SKIP_TTL = 7 * 86400
 
 
 def bad_machine_cache(add=None, ttl=SKIP_TTL):
@@ -221,8 +230,10 @@ def bad_machine_cache(add=None, ttl=SKIP_TTL):
     if add is not None:
         rows.append({"machine_id": add, "ts": now})
         os.makedirs(os.path.dirname(SKIP_CACHE), exist_ok=True)
-        with open(SKIP_CACHE, "w") as fh:
+        tmp = f"{SKIP_CACHE}.{os.getpid()}"
+        with open(tmp, "w") as fh:
             fh.writelines(json.dumps(r) + "\n" for r in rows)
+        os.replace(tmp, SKIP_CACHE)
     return {r["machine_id"] for r in rows}
 
 
@@ -246,12 +257,100 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=())
     raise RuntimeError("no available offer could be rented (all matches taken)")
 
 
+def _wait_gone(inst_id, timeout=300, poll=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(i["id"] == inst_id for i in get_running_instances()):
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _destroy_gone(inst_id):
+    destroy_with_retries(inst_id)
+    if not _wait_gone(inst_id):
+        raise RuntimeError(f"{inst_id} is still listed after destroy")
+
+
+class SetupFailed(RuntimeError):
+    pass
+
+
+def _pull_log(inst, off):
+    f = f"{REMOTE_DIR}/run.log"
+    rc, out, _ = remote.run(
+        inst,
+        f"tail -c +{off} {f} 2>/dev/null | head -c {LOG_CHUNK}",
+        timeout=60,
+        text=False,
+    )
+    if rc != 0:
+        return off, b""
+    return off + len(out), out
+
+
+def _stream_log(inst, off):
+    off, chunk = _pull_log(inst, off)
+    sys.stdout.buffer.write(chunk)
+    sys.stdout.flush()
+    return off
+
+
+def _api_status(inst_id):
+    try:
+        return next(
+            (i["status"] for i in get_running_instances() if i["id"] == inst_id),
+            "gone",
+        )
+    except Exception:
+        return None
+
+
+def _supervise(inst, log):
+    off, lost_since = 1, None
+    while True:
+        time.sleep(SUPERVISE_POLL_S)
+        p = _probe(inst, claim=True)
+        if p is None:
+            status = _api_status(inst["id"])
+            if status in ("gone", "exited"):
+                return "gone", f"node is {status}"
+            if status is not None:
+                lost_since = lost_since or time.time()
+                if time.time() - lost_since > SSH_LOST_S:
+                    return "lost", f"no ssh for {SSH_LOST_S}s while {status}"
+            continue
+        lost_since = None
+        off = _stream_log(inst, off)
+        action, why = _decide(inst, p, int(time.time()), DEFAULT_MAX_AGE_S)
+        if action == "replace":
+            return "recycle", why
+        if p["exit_code"] != "-":
+            return (
+                "done" if p["exit_code"] == "0" else "failed"
+            ), f"rc={p['exit_code']}"
+        if action == "destroy":
+            return "dead", why
+
+
+def _watch(inst, log):
+    verdict, why = _supervise(inst, log)
+    if verdict == "failed":
+        log(f"job failed ({why}); the reaper keeps the node for its grace period")
+        return 1
+    log(f"destroying {inst['id']}: {why}")
+    if verdict in ("recycle", "lost") and inst.get("machine_id"):
+        bad_machine_cache(add=inst["machine_id"])
+    _destroy_gone(inst["id"])
+    return {"done": 0, "gone": 1, "dead": 1}.get(verdict)
+
+
 def _provision_reachable(
     filters, options, label, log, node_key=None, attempts=3, then=None
 ):
     bad_machines = bad_machine_cache()
     if bad_machines:
-        log(f"skipping {len(bad_machines)} machines that failed in the last 24h")
+        log(f"skipping {len(bad_machines)} machines that failed in the last 7 days")
     last_failure = None
     for attempt in range(1, attempts + 1):
         try:
@@ -274,9 +373,10 @@ def _provision_reachable(
             if then:
                 then(inst)
             return inst_id, inst
-        except KeyboardInterrupt:
-            log(f"interrupted; destroying {inst_id}")
+        except (KeyboardInterrupt, SetupFailed):
+            log(f"stopped; destroying {inst_id}")
             destroy_with_retries(inst_id)
+            _wait_gone(inst_id)
             raise
         except Exception as e:
             log(f"node {inst_id} on machine {machine_id} failed ({e!r}); destroying")
@@ -306,7 +406,7 @@ def _push_and_start(inst, src, cmd, job, setup, paths, log, bundle=None):
         log("running setup...")
         rc = remote.shell(inst, f"cd {REMOTE_DIR} && {setup}")
         if rc != 0:
-            raise RuntimeError(f"setup failed (rc={rc})")
+            raise SetupFailed(f"setup failed (rc={rc})")
     log("starting detached job...")
     _start_detached(inst, cmd)
 
@@ -327,6 +427,16 @@ def _start_detached(inst, cmd):
     raise RuntimeError("failed to start detached job (no PGID marker)")
 
 
+def _job(label, cmd, grace, max_age):
+    return {
+        "label": label,
+        "cmd": cmd,
+        "launched_at": int(time.time()),
+        "grace_s": grace,
+        "max_age_s": max_age,
+    }
+
+
 def launch(
     src,
     cmd,
@@ -336,7 +446,6 @@ def launch(
     setup=None,
     grace=900,
     max_age=86400,
-    drain=1800,
     paths=None,
     attach_missing_key=False,
     bundle=None,
@@ -345,14 +454,6 @@ def launch(
     def log(m):
         logger.info("[launch:%s] %s", label, m)
 
-    job = {
-        "label": label,
-        "cmd": cmd,
-        "launched_at": int(time.time()),
-        "grace_s": grace,
-        "max_age_s": max_age,
-        "drain_s": drain,
-    }
     existing = _find_existing(label)
     if existing:
         ids = ", ".join(str(i["id"]) for i in existing)
@@ -366,26 +467,43 @@ def launch(
     if not on_account:
         if not attach_missing_key:
             raise RuntimeError(
-                f"ssh key not on vast account ({pubkey}); pass attach_missing_key=True "
-                f"to add it, else the node would be unreachable"
+                f"ssh key not on vast account ({pubkey}); pass "
+                f"attach_missing_key=True to add it, else the node "
+                f"would be unreachable"
             )
         if node_key_only:
             node_key = pubkey
         else:
             add_account_ssh_key(pubkey)
             log("ssh key added to the vast account")
-    inst_id, inst = _provision_reachable(
-        filters,
-        options,
-        label,
-        log,
-        node_key,
-        then=lambda node: _push_and_start(
-            node, src, cmd, job, setup, paths, log, bundle
-        ),
-    )
-    log(f"job running on {inst_id} ({inst['ssh']}); the reaper owns teardown now")
-    return inst_id
+    recycles = 0
+    while True:
+        inst_id, inst = _provision_reachable(
+            filters,
+            options,
+            label,
+            log,
+            node_key,
+            then=lambda node: _push_and_start(
+                node,
+                src,
+                cmd,
+                _job(label, cmd, grace, max_age),
+                setup,
+                paths,
+                log,
+                bundle,
+            ),
+        )
+        log(f"job running on {inst_id} ({inst['ssh']})")
+        rc = _watch(inst, log)
+        if rc is not None:
+            return rc
+        recycles += 1
+        if recycles > MAX_RECYCLES:
+            log(f"used its {MAX_RECYCLES} recycles, giving up")
+            return 75
+        log(f"taking a fresh node ({recycles}/{MAX_RECYCLES})")
 
 
 def _reset_node(inst, log):
@@ -393,8 +511,7 @@ def _reset_node(inst, log):
     remote.run(
         inst,
         f"{_killgroup('KILL')}; "
-        f"rm -f {REMOTE_DIR}/DONE {REMOTE_DIR}/SHUTDOWN {REMOTE_DIR}/DRAINING "
-        f"{REMOTE_DIR}/PGID {REMOTE_DIR}/HEARTBEAT {REMOTE_DIR}/RESTARTS",
+        f"rm -f {REMOTE_DIR}/EXIT_CODE {REMOTE_DIR}/PGID {REMOTE_DIR}/HEARTBEAT",
         timeout=30,
     )
 
@@ -407,7 +524,6 @@ def rerun(
     cmd=None,
     grace=None,
     max_age=None,
-    drain=None,
     bundle=None,
 ):
     def log(m):
@@ -415,84 +531,75 @@ def rerun(
 
     existing = _find_existing(label)
     if not existing:
-        raise RuntimeError(
-            f"no running node labelled {LABEL_PREFIX}{label}; use launch first"
-        )
+        log("no node with this label; it needs a launch")
+        return 75
     if len(existing) > 1:
         ids = ", ".join(str(i["id"]) for i in existing)
         raise RuntimeError(
             f"multiple nodes labelled {LABEL_PREFIX}{label}: {ids}; destroy extras"
         )
     inst = existing[0]
-    prev = _probe(inst)
+    prev = _probe(inst, claim=True)
     if not prev or not prev["job"]:
-        raise RuntimeError("node has no JOB marker; use launch instead")
-    job = prev["job"]
-    cmd = cmd or job["cmd"]
-    job = {
-        "label": label,
-        "cmd": cmd,
-        "launched_at": int(time.time()),
-        "grace_s": grace if grace is not None else job["grace_s"],
-        "max_age_s": max_age if max_age is not None else job["max_age_s"],
-        "drain_s": drain if drain is not None else job["drain_s"],
-    }
-    _write_job(inst, job)
+        log(f"{inst['id']} is unreachable or has no job; destroying it")
+        _destroy_gone(inst["id"])
+        return 75
+    old = prev["job"]
+    cmd = cmd or old["cmd"]
+    job = _job(
+        label,
+        cmd,
+        old["grace_s"] if grace is None else grace,
+        old["max_age_s"] if max_age is None else max_age,
+    )
     _reset_node(inst, log)
     _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)
     log(f"rerunning on {inst['id']} ({inst['ssh']}); cmd: {cmd}")
-    return inst["id"]
+    rc = _watch(inst, log)
+    return 75 if rc is None else rc
 
 
 PROBE = (
     f"J=$(base64 {REMOTE_DIR}/JOB 2>/dev/null | tr -d '\\n'); "
-    f"D=$(cat {REMOTE_DIR}/DONE 2>/dev/null || echo -); "
-    f"M=$(stat -c %Y {REMOTE_DIR}/DONE 2>/dev/null || echo -); "
+    f"D=$(cat {REMOTE_DIR}/EXIT_CODE 2>/dev/null || echo -); "
+    f"M=$(stat -c %Y {REMOTE_DIR}/EXIT_CODE 2>/dev/null || echo -); "
     f"H=$([ -f {REMOTE_DIR}/HOLD ] && echo 1 || echo 0); "
-    f"R=$(cat {REMOTE_DIR}/DRAINING 2>/dev/null || echo -); "
     f"P=$(cat {REMOTE_DIR}/PGID 2>/dev/null); "
     f'G=$([ -n "$P" ] && echo 1 || echo 0); '
     f"HB=$(stat -c %Y {REMOTE_DIR}/HEARTBEAT 2>/dev/null || echo -); "
     f'A=$([ "$HB" != "-" ] && echo $(($(date +%s) - HB)) || echo -); '
-    f"C=$(cat {REMOTE_DIR}/RESTARTS 2>/dev/null || echo 0); "
+    f"SV=$(stat -c %Y {REMOTE_DIR}/SUPERVISED 2>/dev/null || echo -); "
+    f'S=$([ "$SV" != "-" ] && echo $(($(date +%s) - SV)) || echo -); '
     f"U=$(timeout 10 nvidia-smi --query-gpu=utilization.gpu "
     f"--format=csv,noheader,nounits 2>/dev/null | tr '\\n' ',' | sed 's/,$//'); "
-    f"printf 'job=%s\\ndone=%s\\nmtime=%s\\nhold=%s\\n"
-    f"drain=%s\\nhas_pgid=%s\\nhb_age=%s\\nrestarts=%s\\ngpu=%s\\n' "
-    f'"$J" "$D" "$M" "$H" "$R" "$G" "$A" "$C" "$U"'
+    f"printf 'job=%s\\nexit_code=%s\\nmtime=%s\\nhold=%s\\n"
+    f"has_pgid=%s\\nhb_age=%s\\ngpu=%s\\n"
+    f"sup_age=%s\\n' "
+    f'"$J" "$D" "$M" "$H" "$G" "$A" "$U" "$S"'
 )
 
 
-def _probe(inst):
-    rc, out, _ = remote.run_any(inst, PROBE, timeout=45)
+def _probe(inst, claim=False):
+    touch = f"touch {REMOTE_DIR}/SUPERVISED 2>/dev/null; " if claim else ""
+    rc, out, _ = remote.run_any(inst, touch + PROBE, timeout=45)
     if rc != 0:
         return None
     try:
         f = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
         job = json.loads(base64.b64decode(f["job"])) if f["job"] else None
-        hb = f["hb_age"]
+        hb, sup = f["hb_age"], f.get("sup_age", "-")
         return {
             "job": job,
-            "done": f["done"],
+            "exit_code": f["exit_code"],
             "mtime": f["mtime"],
             "hold": f["hold"] == "1",
-            "drain": f["drain"],
             "has_pgid": f["has_pgid"] == "1",
             "alive": hb != "-" and int(hb) < HEARTBEAT_STALE_S,
-            "restarts": int(f["restarts"] or 0),
             "gpu": f.get("gpu") or "-",
+            "supervised": sup != "-" and int(sup) < SUPERVISED_FRESH_S,
         }
     except Exception:
         return None
-
-
-def _signal_shutdown(inst, deadline):
-    remote.run(
-        inst,
-        f"{_killgroup('TERM')}; "
-        f"touch {REMOTE_DIR}/SHUTDOWN; echo {deadline} > {REMOTE_DIR}/DRAINING",
-        timeout=30,
-    )
 
 
 def _ours(inst):
@@ -516,7 +623,7 @@ def _one(label):
 
 def destroy(label):
     inst = _one(label)
-    destroy_with_retries(inst["id"])
+    _destroy_gone(inst["id"])
     return inst["id"]
 
 
@@ -590,30 +697,23 @@ def _state(p):
         return "unreachable"
     if p["job"] is None:
         return "half-launched"
-    if p["drain"] != "-":
-        return "draining"
-    if p["done"] == "-":
+    if p["exit_code"] == "-":
         return "running"
     return "exited"
 
 
-def _decide_running(p, now, max_restarts):
+def _decide_running(p, now):
     j = p["job"]
     if not p["has_pgid"]:
         if now - j["launched_at"] > LAUNCH_GRACE_S:
             return "destroy", "no PGID long after launch (launch died)"
         return None, "launching, no PGID yet"
     if not p["alive"]:
-        if p["restarts"] < max_restarts:
-            return "restart", (
-                f"job died with no DONE, relaunching "
-                f"({p['restarts'] + 1}/{max_restarts})"
-            )
         if p["hold"]:
-            return None, f"died, exhausted {max_restarts} restarts, HOLD set"
-        return "destroy", f"died, exhausted {max_restarts} restarts"
+            return None, "died without EXIT_CODE, HOLD set"
+        return "replace", "job died without EXIT_CODE"
     if now - j["launched_at"] > j["max_age_s"]:
-        return "signal", "exceeded max_age, sending shutdown heads-up"
+        return "destroy", "exceeded max_age"
     return None, None
 
 
@@ -622,7 +722,7 @@ def _inst_age(inst, now):
     return now - int(sd) if sd else None
 
 
-def _decide(inst, p, now, default_max_age, max_restarts):
+def _decide(inst, p, now, default_max_age):
     state = _state(p)
     if state == "unreachable":
         age = _inst_age(inst, now)
@@ -646,55 +746,47 @@ def _decide(inst, p, now, default_max_age, max_restarts):
         if age > LAUNCH_GRACE_S:
             return "destroy", "half-launched (no JOB) past grace"
         return None, "half-launched, within launch grace"
-    if state == "draining":
-        if p["done"] != "-":
-            return "destroy", f"exited (code {p['done']}) after heads-up"
-        if now >= int(p["drain"]):
-            return "destroy", "ignored SIGTERM past deadline"
-        return None, f"draining, {int(p['drain']) - now}s left"
     if state == "running":
-        return _decide_running(p, now, max_restarts)
-    code, grace, ago = int(p["done"]), p["job"]["grace_s"], now - int(p["mtime"])
+        return _decide_running(p, now)
+    code, grace, ago = int(p["exit_code"]), p["job"]["grace_s"], now - int(p["mtime"])
     if code == 0:
         return "destroy", "succeeded"
     if p["hold"]:
         return None, "failed but HOLD set, leaving"
+    if p["exit_code"] == RECYCLE_EXIT:
+        return "replace", f"asked for a new node (exit {RECYCLE_EXIT})"
     if ago > grace:
         return "destroy", f"failed >{grace}s ago"
     return None, f"failed (exit {code}), {grace - ago}s grace left"
 
 
-def _restart_job(inst, cmd):
-    remote.run(
-        inst,
-        f"{_killgroup('KILL')}; "
-        f"cd {REMOTE_DIR} && rm -f DONE SHUTDOWN DRAINING PGID HEARTBEAT && "
-        f"C=$(cat RESTARTS 2>/dev/null || echo 0) && echo $((C + 1)) > RESTARTS",
-        timeout=30,
-    )
-    _start_detached(inst, cmd)
+def _backstop(inst, p, now):
+    if p["job"]:
+        age = now - p["job"]["launched_at"]
+        limit = p["job"]["max_age_s"]
+    else:
+        age = _inst_age(inst, now)
+        limit = LAUNCH_GRACE_S
+    if age is None or age <= limit + BACKSTOP_SLACK_S:
+        return {"id": inst["id"], "action": None, "msg": "owned by a supervisor"}
+    logger.warning("[reap] %s is %ss old, past its backstop limit", inst["id"], age)
+    destroy_with_retries(inst["id"])
+    return {"id": inst["id"], "action": "destroy", "msg": "past backstop limit"}
 
 
-def _reap_one(inst, now, default_max_age, max_restarts):
-    p = _probe(inst)
+def _reap_one(inst, p, now, default_max_age):
     label = p["job"]["label"] if p and p["job"] else inst.get("label")
-    action, msg = _decide(inst, p, now, default_max_age, max_restarts)
+    action, msg = _decide(inst, p, now, default_max_age)
     if action == "warn":
         logger.warning("[reap] %s %s", label, msg)
     elif msg:
-        logger.info(
-            "[reap] %s %s%s", label, msg, ", destroying" if action == "destroy" else ""
-        )
-    if action == "destroy":
+        logger.info("[reap] %s %s%s", label, msg, ", destroying" if action else "")
+    if action in ("destroy", "replace"):
         destroy_with_retries(inst["id"])
-    elif action == "signal":
-        _signal_shutdown(inst, now + p["job"]["drain_s"])
-    elif action == "restart":
-        _restart_job(inst, p["job"]["cmd"])
     return {"id": inst["id"], "label": label, "action": action, "msg": msg}
 
 
-def reap(default_max_age=86400, max_restarts=3):
+def reap(default_max_age=DEFAULT_MAX_AGE_S):
     now = int(time.time())
     results = []
     managed = failed = 0
@@ -703,7 +795,12 @@ def reap(default_max_age=86400, max_restarts=3):
             continue
         managed += 1
         try:
-            results.append(_reap_one(inst, now, default_max_age, max_restarts))
+            p = _probe(inst)
+            results.append(
+                _backstop(inst, p, now)
+                if p and p["supervised"]
+                else _reap_one(inst, p, now, default_max_age)
+            )
         except Exception as e:
             failed += 1
             logger.warning("[reap] %s error, skipping this tick: %r", inst["id"], e)
@@ -761,6 +858,10 @@ def _left_s(p, now):
     return j["max_age_s"] - (now - j["launched_at"])
 
 
+def _country(geo):
+    return (geo or "").rsplit(",", 1)[-1].strip() or "-"
+
+
 def ps():
     now = int(time.time())
     rows = []
@@ -769,14 +870,14 @@ def ps():
             {
                 "id": inst["id"],
                 "machine_id": inst.get("machine_id") or "-",
+                "country": _country(inst.get("geolocation")),
                 "label": (inst.get("label") or "")[len(LABEL_PREFIX) :],
                 "state": _state(p),
-                "done": p["done"] if p else "-",
+                "exit_code": p["exit_code"] if p else "-",
                 "hold": bool(p and p.get("hold")),
                 "age_s": _age_s(inst, p, now),
                 "left_s": _left_s(p, now),
                 "gpu": p["gpu"] if p and p.get("gpu") else "-",
-                "restarts": p["restarts"] if p and p.get("restarts") else 0,
             }
         )
     return rows

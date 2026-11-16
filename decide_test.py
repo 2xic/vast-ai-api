@@ -30,7 +30,6 @@ JOB = {
     "launched_at": NOW,
     "grace_s": 900,
     "max_age_s": 10_000,
-    "drain_s": 1800,
 }
 INST = {"id": 1, "label": "vrun:t", "start_date": 0}
 
@@ -38,13 +37,11 @@ INST = {"id": 1, "label": "vrun:t", "start_date": 0}
 def P(**kw):
     d = {
         "job": dict(JOB),
-        "done": "-",
+        "exit_code": "-",
         "mtime": "0",
         "hold": False,
-        "drain": "-",
         "has_pgid": True,
         "alive": True,
-        "restarts": 0,
     }
     d.update(kw)
     return d
@@ -58,7 +55,7 @@ NO_SD = {"id": 9, "label": "vrun:t"}
 
 
 PAST_GRACE = NOW + LAUNCH_GRACE_S + 1
-OLD_DONE = P(done="1", mtime=str(NOW - 1000))
+OLD_EXIT_CODE = P(exit_code="1", mtime=str(NOW - 1000))
 
 CASES = [
     ("unreachable_old", inst(1), None, NOW, "destroy"),
@@ -67,27 +64,25 @@ CASES = [
     ("half_launched_old", inst(1), P(job=None), NOW, "destroy"),
     ("half_launched_young", inst(NOW - 50), P(job=None), NOW, None),
     ("half_launched_no_startdate", NO_SD, P(job=None), NOW, "warn"),
-    ("draining_exited", INST, P(drain=str(NOW + 500), done="0"), NOW, "destroy"),
-    ("draining_deadline", INST, P(drain=str(NOW - 1), done="-"), NOW, "destroy"),
-    ("draining_time_left", INST, P(drain=str(NOW + 500), done="-"), NOW, None),
     ("run_nopgid_past_grace", INST, P(has_pgid=False), PAST_GRACE, "destroy"),
     ("run_nopgid_in_grace", INST, P(has_pgid=False), NOW + 10, None),
-    ("crash_restart", INST, P(alive=False, restarts=0), NOW + 100, "restart"),
-    ("crash_cap_hold", INST, P(alive=False, restarts=3, hold=True), NOW + 100, None),
-    ("crash_cap_destroy", INST, P(alive=False, restarts=3), NOW + 100, "destroy"),
-    ("alive_past_maxage", INST, P(alive=True), NOW + 10_001, "signal"),
+    ("crash_replace", INST, P(alive=False), NOW + 100, "replace"),
+    ("crash_hold", INST, P(alive=False, hold=True), NOW + 100, None),
+    ("alive_past_maxage", INST, P(alive=True), NOW + 10_001, "destroy"),
     ("alive_in_maxage", INST, P(alive=True), NOW + 50, None),
-    ("exit_zero", INST, P(done="0"), NOW, "destroy"),
-    ("exit_nonzero_hold", INST, P(done="1", hold=True), NOW, None),
-    ("exit_nonzero_past_grace", INST, OLD_DONE, NOW, "destroy"),
-    ("exit_nonzero_in_grace", INST, P(done="1", mtime=str(NOW - 100)), NOW, None),
+    ("exit_zero", INST, P(exit_code="0"), NOW, "destroy"),
+    ("exit_nonzero_hold", INST, P(exit_code="1", hold=True), NOW, None),
+    ("exit_nonzero_past_grace", INST, OLD_EXIT_CODE, NOW, "destroy"),
+    ("exit_nonzero_in_grace", INST, P(exit_code="1", mtime=str(NOW - 100)), NOW, None),
+    ("exit_recycle", INST, P(exit_code="75"), NOW, "replace"),
+    ("exit_recycle_hold", INST, P(exit_code="75", hold=True), NOW, None),
 ]
 
 
 def main():
     failed = 0
     for name, i, p, now, want in CASES:
-        action, _ = _decide(i, p, now, default_max_age=86_400, max_restarts=3)
+        action, _ = _decide(i, p, now, default_max_age=86_400)
         if action == want:
             print(f"PASS {name}")
         else:

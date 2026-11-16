@@ -32,8 +32,6 @@ from vast_cli.api.run import (
     _killgroup,
     _probe,
     _reset_node,
-    _restart_job,
-    _signal_shutdown,
     _start_detached,
 )
 
@@ -99,12 +97,10 @@ def killgroup(sig):
 @case
 def parse_roundtrip():
     reset(JOB)
-    dexec(f"echo 0 > {REMOTE_DIR}/RESTARTS")
     _start_detached(INST, "sleep 300")
     p = _probe(INST)
     assert p is not None, "probe returned None"
     assert p["job"] == JOB, f"job mismatch: {p['job']}"
-    assert p["restarts"] == 0, p["restarts"]
 
 
 @case
@@ -114,7 +110,7 @@ def running_is_alive():
     p = _probe(INST)
     assert p["has_pgid"], "no pgid after start"
     assert p["alive"], "not alive after start"
-    assert p["done"] == "-", f"unexpected DONE: {p['done']}"
+    assert p["exit_code"] == "-", f"unexpected EXIT_CODE: {p['exit_code']}"
 
 
 @case
@@ -123,7 +119,7 @@ def clean_exit_records_code():
     _start_detached(INST, "sh -c 'exit 7'")
     time.sleep(2)
     p = _probe(INST)
-    assert p["done"] == "7", f"exit code not captured: {p['done']}"
+    assert p["exit_code"] == "7", f"exit code not captured: {p['exit_code']}"
 
 
 @case
@@ -140,7 +136,7 @@ def crash_detected_by_stale_heartbeat():
         run.HEARTBEAT_STALE_S = old
     assert p["has_pgid"], "pgid marker gone"
     assert not p["alive"], "crashed tree still reads alive"
-    assert p["done"] == "-", "DONE written on hard kill (should not be)"
+    assert p["exit_code"] == "-", "EXIT_CODE written on hard kill (should not be)"
 
 
 @case
@@ -153,39 +149,13 @@ def stale_heartbeat_is_dead():
 
 
 @case
-def signal_terms_group_and_records():
+def reset_clears_a_recycle_exit():
     reset(JOB)
     _start_detached(INST, "sleep 300")
-    _signal_shutdown(INST, 12345)
-    time.sleep(2)
-    p = _probe(INST)
-    assert p["drain"] == "12345", f"drain deadline missing: {p['drain']}"
-    ex = dexec(f"test -f {REMOTE_DIR}/SHUTDOWN")[0]
-    assert ex == 0, "SHUTDOWN marker missing"
-    assert p["done"] != "-", "wrapper did not record DONE after child TERM"
-
-
-@case
-def restart_increments_and_revives():
-    reset(JOB)
-    _start_detached(INST, "sleep 300")
-    killgroup("KILL")
-    time.sleep(1)
-    _restart_job(INST, "sleep 300")
-    p = _probe(INST)
-    assert p["restarts"] == 1, f"restart count wrong: {p['restarts']}"
-    assert p["alive"], "not alive after restart"
-    assert p["done"] == "-", "stale DONE survived restart"
-
-
-@case
-def reset_clears_restarts():
-    reset(JOB)
-    _start_detached(INST, "sleep 300")
-    dexec(f"echo 2 > {REMOTE_DIR}/RESTARTS")
+    dexec(f"echo 75 > {REMOTE_DIR}/EXIT_CODE")
     _reset_node(INST, lambda m: None)
-    ex = dexec(f"test -f {REMOTE_DIR}/RESTARTS")[0]
-    assert ex != 0, "RESTARTS survived reset (rerun would inherit stale count)"
+    ex = dexec(f"test -f {REMOTE_DIR}/EXIT_CODE")[0]
+    assert ex != 0, "EXIT_CODE=75 survived reset (rerun would recycle at once)"
 
 
 @case
@@ -221,8 +191,8 @@ def survives_container_reboot():
     dexec(f"touch -d '2 minutes ago' {REMOTE_DIR}/HEARTBEAT")
     p = _probe(INST)
     assert p["has_pgid"] and not p["alive"], "dead-after-reboot job not detected"
-    action, _ = run._decide(INST, p, 2000, default_max_age=86400, max_restarts=3)
-    assert action == "restart", f"reaper must restart post-reboot job, got {action!r}"
+    action, _ = run._decide(INST, p, 2000, default_max_age=86400)
+    assert action == "replace", f"post-reboot job must get a new node, got {action!r}"
 
 
 @case

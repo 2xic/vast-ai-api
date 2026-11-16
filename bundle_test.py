@@ -279,7 +279,6 @@ DEFAULT_DISK = 10
 DEFAULT_PRICE = 10.0
 DEFAULT_GRACE = 900
 DEFAULT_MAX_AGE = 86400
-DEFAULT_DRAIN = 1800
 
 
 @test
@@ -296,11 +295,7 @@ def a_plain_launch_resolves_exactly_todays_values():
     assert f.gpu_name is None and f.verified is True, f
     assert o.disk_space == DEFAULT_DISK, o
     assert seen["bundle"] is None and seen["setup"] is None
-    assert (seen["grace"], seen["max_age"], seen["drain"]) == (
-        DEFAULT_GRACE,
-        DEFAULT_MAX_AGE,
-        DEFAULT_DRAIN,
-    ), seen
+    assert (seen["grace"], seen["max_age"]) == (DEFAULT_GRACE, DEFAULT_MAX_AGE), seen
 
 
 @contextlib.contextmanager

@@ -138,22 +138,22 @@ def shell(inst, cmd, tty=False):
     return subprocess.call([cmd_ssh, *opts, *rest, cmd])
 
 
-def _run_at(argv, cmd, timeout):
+def _run_at(argv, cmd, timeout, text=True):
     try:
         p = subprocess.run(
             [*argv, cmd],
             capture_output=True,
-            text=True,
+            text=text,
             check=False,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return 124, "", "timed out"
+        return 124, "" if text else b"", "timed out"
     return p.returncode, p.stdout, p.stderr
 
 
-def run(inst, cmd, timeout=None):
-    return _run_at(base(inst), cmd, timeout)
+def run(inst, cmd, timeout=None, text=True):
+    return _run_at(base(inst), cmd, timeout, text)
 
 
 def run_any(inst, cmd, timeout=None):

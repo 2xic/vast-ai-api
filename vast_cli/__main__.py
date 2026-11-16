@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import shlex
+import signal
 import sys
 
 from vast_cli.api import AvailableInstancesFilter, InstanceOptions, client, run
@@ -26,7 +27,7 @@ def _confirm(prompt):
 def _state_text(r):
     state = r["state"]
     if state == "exited":
-        state += f"({r['done']})" + (" HOLD" if r["hold"] else "")
+        state += f"({r['exit_code']})" + (" HOLD" if r["hold"] else "")
     return state
 
 
@@ -34,15 +35,17 @@ def _print_ps(rows):
     states = [_state_text(r) for r in rows]
     lw = max([len("LABEL"), *(len(r["label"]) for r in rows)])
     sw = max([len("STATE"), *(len(s) for s in states)])
+    cw = max([len("CC"), *(len(str(r.get("country", "-"))) for r in rows)])
     print(
-        f"{'ID':>10}  {'MACHINE':>8}  {'LABEL':<{lw}} {'STATE':<{sw}} "
-        f"{'AGE':<10} {'LEFT':<10} {'GPU%':<8} RESTARTS"
+        f"{'ID':>10}  {'MACHINE':>8}  {'CC':<{cw}} {'LABEL':<{lw}} {'STATE':<{sw}} "
+        f"{'AGE':<10} {'LEFT':<10} GPU%"
     )
     for r, state in zip(rows, states, strict=True):
         print(
-            f"{r['id']:>10}  {r['machine_id']:>8}  {r['label']:<{lw}} {state:<{sw}} "
+            f"{r['id']:>10}  {r['machine_id']:>8}  {r.get('country', '-')!s:<{cw}} "
+            f"{r['label']:<{lw}} {state:<{sw}} "
             f"{_fmt_dur(r['age_s']):<10} {_fmt_dur(r['left_s']):<10} "
-            f"{r['gpu']:<8} {r['restarts']}"
+            f"{r['gpu']}"
         )
 
 
@@ -120,7 +123,7 @@ def main():
 
     launch_p = sub.add_parser(
         "launch",
-        help="provision a node, push a dir, start a command detached, record it, exit",
+        help="provision a node, run a command, stream it, take a fresh node on request",
     )
     launch_p.add_argument(
         "src", nargs="?", help="local file or dir to push to /root/proj"
@@ -154,13 +157,7 @@ def main():
         "--max-age",
         type=int,
         default=86400,
-        help="hard cap for a job with no DONE marker",
-    )
-    launch_p.add_argument(
-        "--drain",
-        type=int,
-        default=1800,
-        help="seconds a running job gets to clean up after SIGTERM before destroy",
+        help="hard cap for a job with no EXIT_CODE marker",
     )
     launch_p.add_argument(
         "--path",
@@ -216,9 +213,6 @@ def main():
     rr.add_argument(
         "--max-age", type=int, default=None, help="override max-age (default: reuse)"
     )
-    rr.add_argument(
-        "--drain", type=int, default=None, help="override drain (default: reuse)"
-    )
 
     ex = sub.add_parser(
         "exec",
@@ -255,12 +249,6 @@ def main():
         default=86400,
         help="destroy an unreachable managed node older than this",
     )
-    r.add_argument(
-        "--max-restarts",
-        type=int,
-        default=3,
-        help="relaunch a crashed job (no DONE, dead pgid) up to this many times",
-    )
 
     sub.add_parser(
         "ps",
@@ -288,6 +276,7 @@ def main():
     args = parser.parse_args(argv)
     args.ssh_args = ssh_args
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
     try:
         _dispatch(args)
@@ -334,7 +323,7 @@ def _do_launch(args):
         if not _confirm(f"add it to {where}? [y/N] "):
             sys.exit("aborted: no ssh key added, the node would be unreachable")
         attach = True
-    run.launch(
+    return run.launch(
         args.src,
         args.cmd,
         filters,
@@ -343,7 +332,6 @@ def _do_launch(args):
         setup=args.setup,
         grace=args.grace,
         max_age=args.max_age,
-        drain=args.drain,
         paths=args.path,
         attach_missing_key=attach,
         node_key_only=args.node_key,
@@ -355,18 +343,19 @@ def _dispatch(args):
     if args.command == "bundle":
         _do_bundle(args)
     elif args.command == "launch":
-        _do_launch(args)
+        sys.exit(_do_launch(args))
     elif args.command == "rerun":
-        run.rerun(
-            args.label,
-            src=args.src,
-            setup=args.setup,
-            paths=args.path,
-            cmd=args.cmd,
-            grace=args.grace,
-            max_age=args.max_age,
-            drain=args.drain,
-            bundle=args.bundle,
+        sys.exit(
+            run.rerun(
+                args.label,
+                src=args.src,
+                setup=args.setup,
+                paths=args.path,
+                cmd=args.cmd,
+                grace=args.grace,
+                max_age=args.max_age,
+                bundle=args.bundle,
+            )
         )
     elif args.command == "exec":
         sys.exit(run.exec_on(args.label, cmd=" ".join(args.cmd) or None))
@@ -377,7 +366,7 @@ def _dispatch(args):
             return
         os.execvp(argv[0], argv)
     elif args.command == "reap":
-        run.reap(default_max_age=args.max_age, max_restarts=args.max_restarts)
+        run.reap(default_max_age=args.max_age)
     elif args.command == "ps":
         _print_ps(run.ps())
     elif args.command == "max-age":
