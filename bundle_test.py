@@ -34,7 +34,7 @@ os.environ.setdefault("VAST_API_KEY", "test")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vast_cli import __main__ as cli  # noqa: E402
-from vast_cli.api import remote, run  # noqa: E402
+from vast_cli.api import client, remote, run  # noqa: E402
 
 run_git_files = remote.git_files
 
@@ -289,8 +289,8 @@ def a_plain_launch_resolves_exactly_todays_values():
     assert (f.min_gpu, f.min_disk_space_gb) == (1, DEFAULT_DISK), f
     assert (f.max_dollar_price_hour, f.mbps_up, f.mbps_down) == (
         DEFAULT_PRICE,
-        DEFAULT_PRICE,
-        DEFAULT_PRICE,
+        client.MIN_MBPS,
+        client.MIN_MBPS,
     ), f
     assert f.gpu_name is None and f.verified is True, f
     assert o.disk_space == DEFAULT_DISK, o

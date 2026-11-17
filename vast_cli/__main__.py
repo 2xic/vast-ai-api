@@ -147,8 +147,8 @@ def main():
         help="docker image, e.g. 'pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime'",
     )
     launch_p.add_argument("--price", type=float, default=10.0)
-    launch_p.add_argument("--up", type=float, default=10.0)
-    launch_p.add_argument("--down", type=float, default=10.0)
+    launch_p.add_argument("--up", type=float, default=client.MIN_MBPS)
+    launch_p.add_argument("--down", type=float, default=client.MIN_MBPS)
     launch_p.add_argument("--label", default=None)
     launch_p.add_argument(
         "--grace", type=int, default=900, help="seconds a failed node lingers for debug"
@@ -275,7 +275,9 @@ def main():
     argv, ssh_args = _split_ssh(sys.argv[1:])
     args = parser.parse_args(argv)
     args.ssh_args = ssh_args
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
+    )
     signal.signal(signal.SIGTERM, signal.default_int_handler)
 
     try:

@@ -48,6 +48,7 @@ JOB_SH = (
     "trap true TERM\n"
     "[ -f .env ] && . ./.env\n"
     f"export VAST_RECYCLE_EXIT={RECYCLE_EXIT}\n"
+    "export VAST_JOB=1\n"
     "sh run.sh > run.log 2>&1\n"
     "rc=$?\n"
     'kill -KILL "$HB" 2>/dev/null\n'
@@ -72,9 +73,11 @@ def _write_job(inst, job):
 def _killgroup(sig):
     return (
         f"P=$(cat {REMOTE_DIR}/PGID 2>/dev/null); "
-        f'[ -n "$P" ] && for d in /proc/[0-9]*; do '
+        f"for d in /proc/[0-9]*; do "
         f'g=$(sed "s/.*) //" "$d/stat" 2>/dev/null | cut -d" " -f3); '
-        f'[ "$g" = "$P" ] && kill -{sig} "${{d#/proc/}}" 2>/dev/null; '
+        f'{{ [ -n "$P" ] && [ "$g" = "$P" ] || '
+        f'tr "\\0" "\\n" < "$d/environ" 2>/dev/null | grep -qx VAST_JOB=1; }} '
+        f'&& kill -{sig} "${{d#/proc/}}" 2>/dev/null; '
         "done"
     )
 
@@ -289,11 +292,13 @@ def _pull_log(inst, off):
     return off + len(out), out
 
 
-def _stream_log(inst, off):
-    off, chunk = _pull_log(inst, off)
-    sys.stdout.buffer.write(chunk)
-    sys.stdout.flush()
-    return off
+def _stream_log(inst, off, drain=False):
+    while True:
+        off, chunk = _pull_log(inst, off)
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.flush()
+        if not drain or not chunk:
+            return off
 
 
 def _api_status(inst_id):
@@ -321,8 +326,8 @@ def _supervise(inst, log):
                     return "lost", f"no ssh for {SSH_LOST_S}s while {status}"
             continue
         lost_since = None
-        off = _stream_log(inst, off)
         action, why = _decide(inst, p, int(time.time()), DEFAULT_MAX_AGE_S)
+        off = _stream_log(inst, off, drain=action is not None or p["exit_code"] != "-")
         if action == "replace":
             return "recycle", why
         if p["exit_code"] != "-":

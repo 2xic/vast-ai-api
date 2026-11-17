@@ -73,14 +73,17 @@ def countries(text):
     return tuple(dict.fromkeys(out))
 
 
+MIN_MBPS = 100.0
+
+
 @dataclass
 class AvailableInstancesFilter:
     min_gpu: int = 8
     min_disk_space_gb: int = 40
     max_dollar_price_hour: float = 10
     # internet up and down
-    mbps_up: float = 10
-    mbps_down: float = 10
+    mbps_up: float = MIN_MBPS
+    mbps_down: float = MIN_MBPS
     gpu_name: str = None
     verified: bool = True
     skip_machines: tuple = ()

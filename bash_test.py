@@ -159,6 +159,20 @@ def reset_clears_a_recycle_exit():
 
 
 @case
+def reset_kills_a_job_child_in_its_own_session():
+    reset(JOB)
+    dexec("rm -f /tmp/ready && mkfifo /tmp/ready")
+    _start_detached(INST, "setsid sleep 301 & echo > /tmp/ready; wait")
+    dexec("cat /tmp/ready")
+    _reset_node(INST, lambda m: None)
+    left = dexec(
+        "for d in /proc/[0-9]*; do tr '\\0' ' ' < $d/cmdline 2>/dev/null; echo; done"
+        " | grep -c '^sleep 301'"
+    )[1].strip()
+    assert left == "0", f"{left} job child(ren) in a new session survived reset"
+
+
+@case
 def clean_exit_kills_heartbeat():
     reset(JOB)
     _start_detached(INST, "sh -c 'exit 0'")
