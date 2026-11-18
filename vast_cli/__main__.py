@@ -139,6 +139,9 @@ def main():
     launch_p.add_argument(
         "--gpu", default=None, metavar="NAME", help="exact GPU model, e.g. 'H100 SXM'"
     )
+    launch_p.add_argument(
+        "--gpu-ram", type=float, default=0, metavar="GB", help="minimum memory per GPU"
+    )
     launch_p.add_argument("--disk", type=int, default=10)
     launch_p.add_argument(
         "--image",
@@ -270,6 +273,9 @@ def main():
     gpus_p = sub.add_parser("gpus", help="list rentable GPU models and cheapest price")
     gpus_p.add_argument("--price", type=float, default=1000.0, help="max $/hour")
     gpus_p.add_argument("--gpus", type=int, default=1, help="min gpu count")
+    gpus_p.add_argument(
+        "--gpu-ram", type=float, default=0, metavar="GB", help="minimum memory per GPU"
+    )
     _add_any_host(gpus_p)
 
     argv, ssh_args = _split_ssh(sys.argv[1:])
@@ -297,6 +303,10 @@ def _do_bundle(args):
 def _do_launch(args):
     if not args.bundle and not args.src:
         sys.exit("launch needs a src dir or --bundle")
+    options = InstanceOptions()
+    options.disk_space = args.disk
+    if args.image:
+        options.docker_image = args.image
     filters = AvailableInstancesFilter(
         min_gpu=args.gpus,
         min_disk_space_gb=args.disk,
@@ -304,16 +314,14 @@ def _do_launch(args):
         mbps_up=args.up,
         mbps_down=args.down,
         gpu_name=args.gpu,
+        min_gpu_ram_gb=args.gpu_ram,
         verified=not args.any_host,
         skip_machines=args.skip_machines,
         countries=args.countries,
         direct_port=args.direct_port,
         min_reliability=args.min_reliability,
+        min_cuda=options.cuda_version(),
     )
-    options = InstanceOptions()
-    options.disk_space = args.disk
-    if args.image:
-        options.docker_image = args.image
     label = args.label or os.path.basename(os.path.normpath(args.src or "."))
     if not label:
         sys.exit("could not derive a label; pass --label")
@@ -396,7 +404,10 @@ def _dispatch(args):
         print(f"[destroy] {args.label} -> instance {inst_id}")
     elif args.command == "gpus":
         for name, price in run.list_gpus(
-            max_price=args.price, min_gpu=args.gpus, verified=not args.any_host
+            max_price=args.price,
+            min_gpu=args.gpus,
+            verified=not args.any_host,
+            min_gpu_ram_gb=args.gpu_ram,
         ):
             print(f"{name:20} from ${price:.3f}/h")
 

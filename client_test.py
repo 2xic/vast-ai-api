@@ -102,7 +102,7 @@ def _raw_offer(n):
         "dph_total": 0.4,
         "score": 1,
         "disk_space": 50,
-        "gpu_ram": 24,
+        "gpu_ram": 24564,
         "verified": True,
     }
 
@@ -111,12 +111,17 @@ def _market(rows, cap=64):
     asked = []
 
     def fake(method, url):
-        if "gpu_names" in url:
-            return {"success": True, "gpu_names": sorted({r["gpu_name"] for r in rows})}
         q = json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0])
         asked.append(q)
         assert "offset" not in q, "the bundles API rejects offset outright"
-        hits = [r for r in rows if r["gpu_name"] == q["gpu_name"]["eq"]]
+        name = q.get("gpu_name", {})
+        hits = [
+            r
+            for r in rows
+            if r["gpu_name"] == name.get("eq", r["gpu_name"])
+            and r["gpu_name"] not in name.get("notin", ())
+            and r["gpu_ram"] >= q.get("gpu_ram", {}).get("gte", 0)
+        ]
         if q.get("verified"):
             hits = [r for r in hits if r["verified"]]
         hits.sort(key=lambda r: r["dph_total"], reverse=q["order"][0][1] == "desc")
@@ -134,6 +139,32 @@ def a_search_never_asks_for_more_than_the_server_returns():
 
 
 @case
+def hosts_whose_driver_is_older_than_the_image_cuda_are_skipped():
+    images = {
+        "pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime": 12.6,
+        "nvidia/cuda:12.4.1-devel-ubuntu22.04": 12.4,
+        "vastai/pytorch:2.5.1-cuda-12.1.1": 12.1,
+    }
+    for image, want in images.items():
+        options = client.InstanceOptions()
+        options.docker_image = image
+        fake, asked = _market([_raw_offer(1)])
+        search = dataclasses.replace(_FILTER_4090, min_cuda=options.cuda_version())
+        with _patched(client, _request=fake):
+            list(client.get_available_instances(search))
+        assert asked[0]["cuda_max_good"] == {"gte": want}, (image, asked[0])
+
+
+@case
+def every_search_asks_for_nvidia_gpus_only():
+    fake, asked = _market([_raw_offer(1)])
+    with _patched(client, _request=fake):
+        list(client.get_available_instances(_FILTER_4090))
+        run.list_gpus()
+    assert all(q["gpu_arch"] == {"eq": "nvidia"} for q in asked), asked
+
+
+@case
 def a_named_bad_machine_is_never_offered():
     fake, _ = _market([_raw_offer(1), _raw_offer(2)])
     filters = dataclasses.replace(_FILTER_4090, skip_machines=(2,))
@@ -143,24 +174,55 @@ def a_named_bad_machine_is_never_offered():
 
 
 @case
-def every_gpu_model_is_priced_by_its_own_query():
-    rows = [_raw_offer(1), {**_raw_offer(2), "gpu_name": "GTX 1080", "dph_total": 0.02}]
+def a_large_market_is_priced_in_a_few_pages():
+    rows = [
+        {**_raw_offer(m * 100 + n), "gpu_name": f"GPU {m}", "dph_total": m + n / 100}
+        for m in range(40)
+        for n in range(20)
+    ]
     fake, asked = _market(rows)
     with _patched(client, _request=fake):
         got = run.list_gpus()
-    assert got == [("GTX 1080", 0.02), ("RTX 4090", 0.4)], f"one row per model: {got}"
-    assert len(asked) == 2, f"one query per model, not one for the market: {len(asked)}"
+    assert got == sorted((f"GPU {m}", float(m)) for m in range(40)), got[:3]
+    assert len(asked) < 40, f"must not search once per model: {len(asked)} searches"
+    assert asked[0]["order"] == [["dph_total", "asc"]], asked[0]
+    assert asked[1]["gpu_name"]["notin"], (
+        f"later pages must skip seen models: {asked[1]}"
+    )
 
 
 @case
-def the_cheapest_offer_of_a_model_is_the_one_reported():
-    rows = [_raw_offer(1), {**_raw_offer(2), "dph_total": 0.19}]
+def a_server_that_ignores_notin_fails_loudly():
+    fake, _ = _market([_raw_offer(n) for n in range(64)])
+
+    def ignores_notin(method, url):
+        parts = urllib.parse.urlparse(url)
+        q = json.loads(urllib.parse.parse_qs(parts.query)["q"][0])
+        q.pop("gpu_name", None)
+        return fake(
+            method,
+            parts._replace(query=urllib.parse.urlencode({"q": json.dumps(q)})).geturl(),
+        )
+
+    with _patched(client, _request=ignores_notin):
+        try:
+            got = run.list_gpus()
+        except RuntimeError as e:
+            assert "notin" in str(e), e
+        else:
+            raise AssertionError(f"an incomplete list must not be returned: {got}")
+
+
+@case
+def gpu_memory_is_asked_in_megabytes():
+    rows = [_raw_offer(1), {**_raw_offer(2), "gpu_name": "H100 SXM", "gpu_ram": 81559}]
     fake, asked = _market(rows)
     with _patched(client, _request=fake):
-        got = run.list_gpus()
-    assert got == [("RTX 4090", 0.19)], f"the server must sort by price for us: {got}"
-    assert asked[0]["order"] == [["dph_total", "asc"]], f"wrong order: {asked[0]}"
-    assert asked[0]["limit"] == 1, f"only the cheapest row is needed: {asked[0]}"
+        got = run.list_gpus(min_gpu_ram_gb=80)
+    assert asked[0]["gpu_ram"] == {"gte": 80000}, (
+        f"vast stores gpu_ram in MB: {asked[0]}"
+    )
+    assert got == [("H100 SXM", 0.4)], f"the 24 GB card must be filtered out: {got}"
 
 
 @case

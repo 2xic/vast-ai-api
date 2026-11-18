@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlencode
@@ -87,6 +88,9 @@ class AvailableInstancesFilter:
     gpu_name: str = None
     verified: bool = True
     skip_machines: tuple = ()
+    skip_gpus: tuple = ()
+    min_gpu_ram_gb: float = 0
+    min_cuda: float = 0
     countries: tuple = ()
     direct_port: bool = False
     min_reliability: float = 0.0
@@ -108,13 +112,6 @@ def _offer(i):
     }
 
 
-def gpu_names():
-    body = _request("GET", f"{api_url}/gpu_names/unique/")
-    if not body.get("success"):
-        raise RuntimeError(f"gpu_names failed: {body}")
-    return body["gpu_names"]
-
-
 def get_available_instances(
     options: AvailableInstancesFilter, order=None, limit=OFFER_LIMIT
 ):
@@ -128,11 +125,18 @@ def get_available_instances(
         "order": order or [["score", "desc"]],
         "limit": min(limit, OFFER_LIMIT),
         "type": "ask",  # bid or ask, ask = on - demand
+        "gpu_arch": {"eq": "nvidia"},
     }
     if options.verified:
         search["verified"] = {"eq": True}
     if options.gpu_name:
         search["gpu_name"] = {"eq": options.gpu_name}
+    elif options.skip_gpus:
+        search["gpu_name"] = {"notin": list(options.skip_gpus)}
+    if options.min_cuda:
+        search["cuda_max_good"] = {"gte": options.min_cuda}
+    if options.min_gpu_ram_gb:
+        search["gpu_ram"] = {"gte": options.min_gpu_ram_gb * 1000}
     if options.countries:
         search["geolocation"] = {"in": list(options.countries)}
     if options.direct_port:
@@ -165,6 +169,10 @@ class InstanceOptions:
     # ["-p 8081:8081", "-p 8082:8082"]
     docker_options: list[str] = field(default_factory=list)
     disk_space = 10  # gb
+
+    def cuda_version(self):
+        found = re.search(r"cuda[-:]?(\d+\.\d+)", self.docker_image)
+        return float(found.group(1)) if found else 0
 
 
 def create_instance(offer_id, options: InstanceOptions = None, label=None):

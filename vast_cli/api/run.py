@@ -6,10 +6,10 @@ import os
 import sys
 import tarfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from vast_cli.api import remote
 from vast_cli.api.client import (
+    OFFER_LIMIT,
     AvailableInstancesFilter,
     InstanceOptions,
     add_account_ssh_key,
@@ -18,7 +18,6 @@ from vast_cli.api.client import (
     delete_instance,
     get_available_instances,
     get_running_instances,
-    gpu_names,
     list_ssh_keys,
     wait_until_ready,
 )
@@ -817,25 +816,31 @@ def reap(default_max_age=DEFAULT_MAX_AGE_S):
     return results
 
 
-def list_gpus(max_price=1000.0, min_gpu=1, verified=True):
+def list_gpus(max_price=1000.0, min_gpu=1, verified=True, min_gpu_ram_gb=0):
     base_filter = AvailableInstancesFilter(
-        min_gpu=min_gpu, max_dollar_price_hour=max_price, verified=verified
+        min_gpu=min_gpu,
+        max_dollar_price_hour=max_price,
+        verified=verified,
+        min_gpu_ram_gb=min_gpu_ram_gb,
     )
-
-    def cheapest(name):
-        offer = next(
-            get_available_instances(
-                dataclasses.replace(base_filter, gpu_name=name),
-                order=[["dph_total", "asc"]],
-                limit=1,
-            ),
-            None,
+    found = {}
+    while True:
+        page = get_available_instances(
+            dataclasses.replace(base_filter, skip_gpus=tuple(found)),
+            order=[["dph_total", "asc"]],
         )
-        return (name, offer["price"]) if offer else None
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        rows = pool.map(cheapest, gpu_names())
-    return sorted(r for r in rows if r)
+        offers = list(page)
+        if not offers:
+            return sorted(found.items())
+        new = {}
+        for o in offers:
+            if o["gpu"] not in found:
+                new.setdefault(o["gpu"], o["price"])
+        if not new:
+            raise RuntimeError("offer search ignored the gpu_name notin filter")
+        found.update(new)
+        if len(offers) < OFFER_LIMIT:
+            return sorted(found.items())
 
 
 def list_managed():
