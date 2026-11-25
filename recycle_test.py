@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
+import os
 import sys
 import tempfile
 import types
@@ -29,6 +30,7 @@ REAL = {
     for k in (
         "_provision_reachable",
         "_push_and_start",
+        "_watch",
         "_probe",
         "_api_status",
         "_wait_gone",
@@ -73,6 +75,7 @@ class _Clock:
 def _harness(tmp, probes, logs=(), status="running", gone=True):
     for k, v in REAL.items():
         setattr(run, k, v)
+    run.REAP_STATE = f"{tmp}/reap_state.json"
     calls = {"black": [], "destroyed": [], "nodes": [], "out": []}
     run.time = _Clock()
     run.bad_machine_cache = lambda add=None, ttl=None: calls["black"].append(add)
@@ -264,6 +267,48 @@ def test_a_rerun_without_a_node_exits_75_so_the_caller_launches():
         assert calls["destroyed"] == []
 
 
+def test_a_rerun_refuses_a_node_that_does_not_fit_and_leaves_it_alone():
+    node = {"id": 9, "gpu": "RTX 3090", "num_gpus": 1, "disk": 40.0, "ssh": "ssh://x"}
+    for want, named in (
+        ({"gpu": "RTX 4090"}, "gpu is RTX 3090"),
+        ({"num_gpus": 2}, "num_gpus is 1"),
+        ({"disk": 80}, "disk is 40.0"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = _harness(tmp, [])
+            run._find_existing = lambda label: [node]
+            run._probe = lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed"))
+            try:
+                run.rerun("t", want=want)
+            except RuntimeError as e:
+                assert named in str(e), e
+            else:
+                raise AssertionError(f"{want} must be refused")
+            assert calls["destroyed"] == []
+
+
+def test_a_rerun_check_passes_a_fitting_node_without_touching_it():
+    node = {"id": 9, "gpu": "RTX 4090", "num_gpus": 1, "disk": 40.0}
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = _harness(tmp, [])
+        run._find_existing = lambda label: [node]
+        run._probe = lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed"))
+        want = {"gpu": "RTX 4090", "num_gpus": 1, "disk": 40}
+        assert run.rerun("t", want=want, check=True) == 0
+        assert calls["destroyed"] == []
+
+
+def test_a_detached_launch_and_rerun_return_while_the_job_runs():
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = _harness(tmp, [_probe()])
+        run._watch = lambda *a: (_ for _ in ()).throw(AssertionError("watched"))
+        args = ("./", "c", run.AvailableInstancesFilter(), run.InstanceOptions(), "t")
+        assert run.launch(*args, detach=True) == 0
+        run._find_existing = lambda label: [{"id": 9, "ssh": "ssh://x"}]
+        assert run.rerun("t", detach=True) == 0
+        assert calls["destroyed"] == []
+
+
 def test_a_rerun_on_a_broken_node_destroys_it_and_exits_75():
     with tempfile.TemporaryDirectory() as tmp:
         calls = _harness(tmp, [])
@@ -300,6 +345,59 @@ def test_the_backstop_destroys_an_owned_node_long_past_its_max_age():
     with tempfile.TemporaryDirectory() as tmp:
         late = NOW + 86400 + 1800 + run.BACKSTOP_SLACK_S
         assert _reap(tmp, _probe(supervised=True), late) == [7]
+
+
+def _reap_ticks(tmp, probes, start, step=300, start_date=NOW - 100):
+    calls = _harness(tmp, [])
+    inst = {"id": 7, "label": "vrun:t", "start_date": start_date}
+    seq, real_path = list(probes), run.REAP_STATE
+    real_list = run.get_running_instances
+    run.REAP_STATE = f"{tmp}/state/reap.json"
+    run.get_running_instances = lambda: iter([inst])
+    run._probe = lambda i: seq.pop(0)
+    destroyed_at = []
+    try:
+        for n in range(len(probes)):
+            run.time.t = start + n * step
+            run.reap()
+            destroyed_at.append(len(calls["destroyed"]))
+    finally:
+        run.REAP_STATE, run.get_running_instances = real_path, real_list
+    return destroyed_at
+
+
+PAST_LIMIT = NOW + 86400 + 60
+
+
+def test_the_reaper_destroys_an_unreachable_node_only_after_six_failed_probes():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _reap_ticks(tmp, [None] * 6, PAST_LIMIT) == [0, 0, 0, 0, 0, 1]
+
+
+def test_quick_reaper_runs_do_not_use_up_the_retries():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _reap_ticks(tmp, [None] * 10, PAST_LIMIT, step=10)[-1] == 0
+
+
+def test_a_good_probe_starts_the_failed_probe_count_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        probes = [None] * 5 + [_probe(supervised=True)] + [None] * 5
+        assert _reap_ticks(tmp, probes, PAST_LIMIT)[-1] == 0
+
+
+def test_an_unreachable_node_keeps_the_longer_limit_of_its_own_job():
+    long_job = _probe(supervised=True)
+    long_job["job"]["max_age_s"] = 2 * 86400
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _reap_ticks(tmp, [long_job] + [None] * 20, PAST_LIMIT)[-1] == 0
+
+
+def test_a_damaged_reap_state_file_only_restarts_the_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(f"{tmp}/state")
+        with open(f"{tmp}/state/reap.json", "w") as fh:
+            fh.write("{broken")
+        assert _reap_ticks(tmp, [None] * 6, PAST_LIMIT) == [0, 0, 0, 0, 0, 1]
 
 
 def test_a_job_that_died_without_exiting_gets_a_fresh_node():

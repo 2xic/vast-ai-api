@@ -315,6 +315,9 @@ def _instance_row(instance):
         "status_msg": (instance.get("status_msg") or "").strip(),
         "label": instance.get("label"),
         "start_date": instance.get("start_date"),
+        "gpu": instance.get("gpu_name"),
+        "num_gpus": instance.get("num_gpus"),
+        "disk": instance.get("disk_space"),
     }
 
 

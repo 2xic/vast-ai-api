@@ -14,6 +14,7 @@ import types
 import urllib.parse
 
 os.environ.setdefault("VAST_API_KEY", "test")
+os.environ["VAST_REAP_STATE"] = os.path.join(tempfile.mkdtemp(), "reap_state.json")
 
 
 def _stub(name, **attrs):
@@ -153,6 +154,52 @@ def hosts_whose_driver_is_older_than_the_image_cuda_are_skipped():
         with _patched(client, _request=fake):
             list(client.get_available_instances(search))
         assert asked[0]["cuda_max_good"] == {"gte": want}, (image, asked[0])
+
+
+@case
+def a_launch_with_no_match_names_the_filter_that_blocks_it():
+    fake, _ = _market([_raw_offer(1)])
+
+    def slow_hosts_only(method, url):
+        q = json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0])
+        return fake(method, url) if q["inet_down"]["gte"] < 500 else {"offers": []}
+
+    search = dataclasses.replace(_FILTER_4090, mbps_down=500)
+    with _patched(client, _request=slow_hosts_only):
+        try:
+            run._rent_offer(search, None, "job", print)
+        except RuntimeError as e:
+            assert "mbps_down=0 gives 1" in str(e), e
+            assert "min_reliability" not in str(e), e
+        else:
+            raise AssertionError("a launch with no offer must fail")
+
+
+@case
+def a_country_list_that_blocks_every_offer_is_named():
+    fake, _ = _market([_raw_offer(1)])
+
+    def abroad(method, url):
+        q = json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0])
+        return {"offers": []} if "geolocation" in q else fake(method, url)
+
+    search = dataclasses.replace(_FILTER_4090, countries=("NO",))
+    with _patched(client, _request=abroad):
+        msg = _raises(RuntimeError, run._rent_offer, search, None, "job", print)
+    assert "countries=() gives 1" in msg, msg
+
+
+@case
+def a_launch_whose_matches_all_failed_before_does_not_blame_a_filter():
+    fake, asked = _market([_raw_offer(1)])
+    with _patched(client, _request=fake):
+        try:
+            run._rent_offer(_FILTER_4090, None, "job", print, skip={1})
+        except RuntimeError as e:
+            assert "failed recently" in str(e), e
+        else:
+            raise AssertionError("a launch with only bad machines must fail")
+    assert len(asked) == 1, asked
 
 
 @case
@@ -350,7 +397,8 @@ def _launch_filter(argv):
         launch=lambda *a, **k: seen.append(a[2]),
     ):
         sys.argv = argv
-        main_mod.main()
+        with contextlib.suppress(SystemExit):
+            main_mod.main()
     return seen[0]
 
 
@@ -502,7 +550,7 @@ def reap_survives_one_bad_instance():
             raise RuntimeError("probe blew up")
 
     run._probe = fake_probe
-    results = run.reap(default_max_age=86_400, max_restarts=3)
+    results = run.reap(default_max_age=86_400)
     ids = [r["id"] for r in results]
     assert ids == [1], f"bad instance should be skipped, good kept: {ids}"
 
@@ -518,7 +566,7 @@ def reap_raises_only_when_all_fail():
 
     run._probe = boom
     try:
-        run.reap(default_max_age=86_400, max_restarts=3)
+        run.reap(default_max_age=86_400)
     except RuntimeError:
         return
     raise AssertionError("all-fail tick should raise (environment broken)")
@@ -662,6 +710,7 @@ def _launch_that_fails(boom=None):
             wait_until_ready=lambda i, log=None: {"id": 5, "ssh": "ssh://x"},
             _push_and_start=boom or default_boom,
             destroy_with_retries=destroyed.append,
+            _wait_gone=lambda i: True,
         ),
         _patched(run.remote, wait=lambda inst, log=None: None),
         contextlib.suppress(RuntimeError, KeyboardInterrupt),
@@ -688,7 +737,7 @@ def a_ctrl_c_mid_launch_still_destroys_the_node():
 @case
 def a_held_node_is_still_reaped_once_it_ages_out():
     p = {"job": {"launched_at": 0}, "has_pgid": False, "hold": True}
-    action = run._decide_running(p, run.LAUNCH_GRACE_S + 100, 3)[0]
+    action = run._decide_running(p, run.LAUNCH_GRACE_S + 100)[0]
     assert action == "destroy", f"a hold must not buy a node forever: {action}"
 
 
@@ -931,7 +980,7 @@ def _two_route_node():
 
 
 def _answers(alive):
-    def fake(argv, cmd, timeout):
+    def fake(argv, cmd, timeout, *_):
         host = next(a for a in argv if a.startswith("root@"))[len("root@") :]
         return (0, host, "") if host == alive else (255, "", f"refused by {host}")
 
@@ -1010,6 +1059,7 @@ def a_missing_key_goes_on_the_account_before_the_node_is_rented():
             (5, {"id": 5, "ssh": "ssh://x"}),
         )[1],
         _push_and_start=lambda *a, **k: None,
+        _watch=lambda *a: 0,
     )
     with _patched(run, **patches):
         run.launch("/tmp", "c", None, None, "job", attach_missing_key=True)
@@ -1035,6 +1085,7 @@ def node_key_only_attaches_to_the_node_and_leaves_the_account_alone():
         attach_ssh_key=lambda inst_id, key: attached.append((inst_id, key)),
         wait_until_ready=lambda inst_id, log=None: {"id": 5, "ssh": "ssh://x"},
         _push_and_start=lambda *a, **k: None,
+        _watch=lambda *a: 0,
     )
     with (
         _patched(run, **patches),
@@ -1211,16 +1262,28 @@ def a_message_that_changes_after_an_error_resets_the_stall_clock():
     assert inst["ssh_host"] == "h", f"an error poll must not freeze the clock: {inst}"
 
 
+@contextlib.contextmanager
+def _isolated():
+    mods = (main_mod, client, remote, run, os, sys)
+    saved = [dict(vars(m)) for m in mods]
+    try:
+        yield
+    finally:
+        for m, attrs in zip(mods, saved, strict=True):
+            vars(m).update(attrs)
+
+
 def main():
     failed = 0
     for fn in CASES:
         try:
-            fn()
+            with _isolated():
+                fn()
             print(f"PASS {fn.__name__}")
         except AssertionError as e:
             failed += 1
             print(f"FAIL {fn.__name__}: {e}")
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             failed += 1
             print(f"ERROR {fn.__name__}: {e!r}")
     print(f"\n{len(CASES) - failed}/{len(CASES)} passed")

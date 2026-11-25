@@ -27,6 +27,8 @@ LABEL_PREFIX = "vrun:"
 LAUNCH_GRACE_S = 1800
 DEFAULT_MAX_AGE_S = 86400
 BACKSTOP_SLACK_S = 3600
+UNREACHABLE_PROBES = 6
+UNREACHABLE_S = 1500
 SUPERVISED_FRESH_S = 300
 HEARTBEAT_STALE_S = 90
 RECYCLE_EXIT = "75"
@@ -41,7 +43,7 @@ JOB_SH = (
     "#!/bin/sh\n"
     'cd "$(dirname "$0")"\n'
     "touch HEARTBEAT\n"
-    "echo $$ > PGID\n"
+    "echo $$ > PGID.tmp && mv -f PGID.tmp PGID\n"
     "( trap '' TERM; while :; do touch HEARTBEAT; sleep 20; done ) &\n"
     "HB=$!\n"
     "trap true TERM\n"
@@ -51,7 +53,7 @@ JOB_SH = (
     "sh run.sh > run.log 2>&1\n"
     "rc=$?\n"
     'kill -KILL "$HB" 2>/dev/null\n'
-    "echo $rc > EXIT_CODE\n"
+    "echo $rc > EXIT_CODE.tmp && mv -f EXIT_CODE.tmp EXIT_CODE\n"
 )
 
 
@@ -59,7 +61,8 @@ def _put_file(inst, name, content):
     b = base64.b64encode(content.encode()).decode()
     return remote.run(
         inst,
-        f"mkdir -p {REMOTE_DIR} && echo {b} | base64 -d > {REMOTE_DIR}/{name}",
+        f"mkdir -p {REMOTE_DIR} && T={REMOTE_DIR}/.{name}.$$ && "
+        f"echo {b} | base64 -d > $T && mv -f $T {REMOTE_DIR}/{name}",
         timeout=60,
     )[0]
 
@@ -239,10 +242,35 @@ def bad_machine_cache(add=None, ttl=SKIP_TTL):
     return {r["machine_id"] for r in rows}
 
 
+def _blocking_filters(filters: AvailableInstancesFilter):
+    relaxed = {
+        "min_cuda": 0,
+        "direct_port": False,
+        "min_reliability": 0.0,
+        "mbps_down": 0,
+        "mbps_up": 0,
+        "min_disk_space_gb": 0,
+        "countries": (),
+        "verified": False,
+        "max_dollar_price_hour": filters.max_dollar_price_hour * 2,
+    }
+    counts = {
+        f"{name}={off}": len(
+            list(get_available_instances(dataclasses.replace(filters, **{name: off})))
+        )
+        for name, off in relaxed.items()
+        if getattr(filters, name) != off
+    }
+    return {name: n for name, n in counts.items() if n}
+
+
 def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=()):
+    tried = skipped = 0
     for offer in get_available_instances(filters):
         if offer["machine_id"] in skip:
+            skipped += 1
             continue
+        tried += 1
         log(
             f"offer {offer['id']} ({offer['num_gpus']}x {offer['gpu']}, "
             f"${offer['price']}/h)"
@@ -256,7 +284,52 @@ def _rent_offer(filters: AvailableInstancesFilter, options, label, log, skip=())
                 continue
             log(f"create failed: {e}")
             raise
-    raise RuntimeError("no available offer could be rented (all matches taken)")
+    if tried:
+        raise RuntimeError(f"all {tried} matching offers were taken")
+    if skipped:
+        raise RuntimeError(
+            f"all {skipped} matching offers are on machines that failed recently"
+        )
+    blocking = _blocking_filters(filters)
+    if not blocking:
+        raise RuntimeError(
+            f"no {filters.gpu_name or 'GPU'} offer, even with each filter relaxed"
+        )
+    found = ", ".join(f"{name} gives {n}" for name, n in blocking.items())
+    raise RuntimeError(f"no offer matched the filter; {found}")
+
+
+REAP_STATE = os.path.expanduser(
+    os.environ.get("VAST_REAP_STATE", "~/.cache/vast/reap_state.json")
+)
+
+
+def _load_reap_state():
+    try:
+        with open(REAP_STATE) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_reap_state(state):
+    os.makedirs(os.path.dirname(REAP_STATE), exist_ok=True)
+    tmp = f"{REAP_STATE}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, REAP_STATE)
+
+
+def _account(seen, p, now):
+    if p is None:
+        return {
+            **seen,
+            "fails": seen.get("fails", 0) + 1,
+            "since": seen.get("since", now),
+        }
+    job = p["job"]
+    return {"deadline": job["launched_at"] + job["max_age_s"]} if job else {}
 
 
 def _wait_gone(inst_id, timeout=300, poll=5):
@@ -454,6 +527,7 @@ def launch(
     attach_missing_key=False,
     bundle=None,
     node_key_only=False,
+    detach=False,
 ):
     def log(m):
         logger.info("[launch:%s] %s", label, m)
@@ -500,6 +574,8 @@ def launch(
             ),
         )
         log(f"job running on {inst_id} ({inst['ssh']})")
+        if detach:
+            return 0
         rc = _watch(inst, log)
         if rc is not None:
             return rc
@@ -520,6 +596,19 @@ def _reset_node(inst, log):
     )
 
 
+def _mismatch(inst, want):
+    checks = {
+        "gpu": lambda have, asked: have == asked,
+        "num_gpus": lambda have, asked: have is not None and have >= asked,
+        "disk": lambda have, asked: have is not None and have >= asked,
+    }
+    return ", ".join(
+        f"{name} is {inst.get(name)}, asked for {want[name]}"
+        for name, ok in checks.items()
+        if want.get(name) is not None and not ok(inst.get(name), want[name])
+    )
+
+
 def rerun(
     label,
     src=".",
@@ -529,6 +618,9 @@ def rerun(
     grace=None,
     max_age=None,
     bundle=None,
+    want=None,
+    check=False,
+    detach=False,
 ):
     def log(m):
         logger.info("[rerun:%s] %s", label, m)
@@ -543,6 +635,14 @@ def rerun(
             f"multiple nodes labelled {LABEL_PREFIX}{label}: {ids}; destroy extras"
         )
     inst = existing[0]
+    wrong = _mismatch(inst, want or {})
+    if wrong:
+        raise RuntimeError(
+            f"node {inst['id']} does not fit: {wrong}; destroy it and launch, "
+            f"or ask for what it has"
+        )
+    if check:
+        return 0
     prev = _probe(inst, claim=True)
     if not prev or not prev["job"]:
         log(f"{inst['id']} is unreachable or has no job; destroying it")
@@ -559,6 +659,8 @@ def rerun(
     _reset_node(inst, log)
     _push_and_start(inst, src, cmd, job, setup, paths, log, bundle)
     log(f"rerunning on {inst['id']} ({inst['ssh']}); cmd: {cmd}")
+    if detach:
+        return 0
     rc = _watch(inst, log)
     return 75 if rc is None else rc
 
@@ -726,20 +828,29 @@ def _inst_age(inst, now):
     return now - int(sd) if sd else None
 
 
-def _decide(inst, p, now, default_max_age):
-    state = _state(p)
-    if state == "unreachable":
-        age = _inst_age(inst, now)
+def _decide_unreachable(inst, now, default_max_age, seen):
+    age = _inst_age(inst, now)
+    deadline = seen.get("deadline")
+    if deadline is None:
         if age is None:
             return (
                 "warn",
                 "unreachable with no start_date; cannot age out, destroy by hand",
             )
-        return (
-            ("destroy", "unreachable > max_age")
-            if age > default_max_age
-            else (None, "unreachable, skipping")
-        )
+        deadline = now - age + default_max_age
+    fails, down = seen.get("fails", 0), now - seen.get("since", now)
+    what = f"unreachable for {down}s, {fails} failed probes"
+    if now <= deadline:
+        return None, f"{what}, {deadline - now}s before its limit"
+    if fails < UNREACHABLE_PROBES or down < UNREACHABLE_S:
+        return None, f"{what}, past its limit, trying again"
+    return "destroy", f"{what}, past its limit"
+
+
+def _decide(inst, p, now, default_max_age, seen=None):
+    state = _state(p)
+    if state == "unreachable":
+        return _decide_unreachable(inst, now, default_max_age, seen or {})
     if state == "half-launched":
         age = _inst_age(inst, now)
         if age is None:
@@ -778,9 +889,9 @@ def _backstop(inst, p, now):
     return {"id": inst["id"], "action": "destroy", "msg": "past backstop limit"}
 
 
-def _reap_one(inst, p, now, default_max_age):
+def _reap_one(inst, p, now, default_max_age, seen=None):
     label = p["job"]["label"] if p and p["job"] else inst.get("label")
-    action, msg = _decide(inst, p, now, default_max_age)
+    action, msg = _decide(inst, p, now, default_max_age, seen)
     if action == "warn":
         logger.warning("[reap] %s %s", label, msg)
     elif msg:
@@ -793,21 +904,26 @@ def _reap_one(inst, p, now, default_max_age):
 def reap(default_max_age=DEFAULT_MAX_AGE_S):
     now = int(time.time())
     results = []
+    old, state = _load_reap_state(), {}
     managed = failed = 0
     for inst in get_running_instances():
         if not _ours(inst):
             continue
         managed += 1
+        key = str(inst["id"])
+        state[key] = old.get(key, {})
         try:
             p = _probe(inst)
+            state[key] = _account(state[key], p, now)
             results.append(
                 _backstop(inst, p, now)
                 if p and p["supervised"]
-                else _reap_one(inst, p, now, default_max_age)
+                else _reap_one(inst, p, now, default_max_age, state[key])
             )
         except Exception as e:
             failed += 1
             logger.warning("[reap] %s error, skipping this tick: %r", inst["id"], e)
+    _save_reap_state(state)
     if managed and failed == managed:
         raise RuntimeError(
             f"reap failed on all {managed} managed node(s); environment likely "

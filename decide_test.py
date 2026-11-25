@@ -58,7 +58,7 @@ PAST_GRACE = NOW + LAUNCH_GRACE_S + 1
 OLD_EXIT_CODE = P(exit_code="1", mtime=str(NOW - 1000))
 
 CASES = [
-    ("unreachable_old", inst(1), None, NOW, "destroy"),
+    ("unreachable_old_first_probe", inst(1), None, NOW, None),
     ("unreachable_young", inst(NOW - 50), None, NOW, None),
     ("unreachable_no_startdate", NO_SD, None, NOW, "warn"),
     ("half_launched_old", inst(1), P(job=None), NOW, "destroy"),

@@ -108,6 +108,14 @@ def _add_bundle_flag(p):
     )
 
 
+def _add_detach(p):
+    p.add_argument(
+        "--detach",
+        action="store_true",
+        help="return once the job starts; the reaper owns the node, no fresh node",
+    )
+
+
 def _split_ssh(argv):
     if not argv or argv[0] != "ssh":
         return argv, []
@@ -175,6 +183,7 @@ def main():
         help="attach the ssh key to this node only, not to your vast account",
     )
     _add_any_host(launch_p)
+    _add_detach(launch_p)
     _add_skip_machines(launch_p)
     _add_offer_filters(launch_p)
 
@@ -216,6 +225,15 @@ def main():
     rr.add_argument(
         "--max-age", type=int, default=None, help="override max-age (default: reuse)"
     )
+    rr.add_argument("--gpu", default=None, help="refuse a node with another GPU model")
+    rr.add_argument("--gpus", type=int, default=None, help="refuse fewer GPUs")
+    rr.add_argument("--disk", type=int, default=None, help="refuse a smaller disk (GB)")
+    rr.add_argument(
+        "--check",
+        action="store_true",
+        help="only report whether the node fits; change nothing",
+    )
+    _add_detach(rr)
 
     ex = sub.add_parser(
         "exec",
@@ -250,7 +268,7 @@ def main():
         "--max-age",
         type=int,
         default=86400,
-        help="destroy an unreachable managed node older than this",
+        help="limit for an unreachable node whose job was never read",
     )
 
     sub.add_parser(
@@ -346,6 +364,7 @@ def _do_launch(args):
         attach_missing_key=attach,
         node_key_only=args.node_key,
         bundle=args.bundle,
+        detach=args.detach,
     )
 
 
@@ -365,6 +384,13 @@ def _dispatch(args):
                 grace=args.grace,
                 max_age=args.max_age,
                 bundle=args.bundle,
+                want={
+                    "gpu": args.gpu,
+                    "num_gpus": args.gpus,
+                    "disk": args.disk,
+                },
+                check=args.check,
+                detach=args.detach,
             )
         )
     elif args.command == "exec":
